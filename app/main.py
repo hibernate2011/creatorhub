@@ -628,7 +628,7 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(15)
     _webhook_delivery_task = asyncio.create_task(webhook_delivery_loop())
     from .comment_ai import worker as comment_ai_worker
-    comment_ai_task = asyncio.create_task(comment_ai_worker())
+    comment_ai_task = asyncio.create_task(comment_ai_worker(engine.load_douyin_comment_title))
     yield
     comment_ai_task.cancel()
     await asyncio.gather(comment_ai_task, return_exceptions=True)

@@ -3214,6 +3214,69 @@ class MonitorEngine:
         with get_session() as s:
             return find_work_title(s, platform, aweme_id, work_desc)
 
+    async def load_douyin_comment_title(self, aweme_id: str, watch_id: int, comment_id: str) -> str:
+        """Read the work itself when old comments lack a stored title."""
+        from ..comment_ai import clean_work_title
+        from ..platforms.douyin.web_session import context_key, validated_detail_context
+
+        if not aweme_id.isascii() or not aweme_id.isdecimal():
+            return ""
+        with get_session() as s:
+            watch = s.get(CommentWatch, watch_id) if watch_id else None
+            account_id = watch.account_id if watch and watch.platform == "douyin" else None
+            if not account_id and not watch_id:
+                source = s.exec(select(CommentRecord).where(
+                    CommentRecord.platform == "douyin", CommentRecord.aweme_id == aweme_id,
+                    CommentRecord.comment_id == comment_id,
+                    or_(CommentRecord.watch_id == 0, CommentRecord.watch_id.is_(None))
+                ).order_by(CommentRecord.id)).first()
+                target = s.get(MonitorTarget, source.target_id) if source and source.target_id else None
+                if target and target.platform == "douyin":
+                    account_id = target.account_id
+                elif source and source.watch_id == 0:
+                    account_id = s.exec(select(AccountWork.account_id).where(
+                        AccountWork.platform == "douyin", AccountWork.item_id == aweme_id
+                    ).order_by(AccountWork.id.desc())).first()
+
+        async def read_detail():
+            account = self._load_account(account_id)
+            if account_id and (not account or account.platform != "douyin"
+                               or account.status != "active" or self._proxy_bad(account)):
+                return "", "account_unavailable"
+            mode = resolve_transport(self.cfg, "douyin", "public_monitor", account)["effective_mode"]
+            error = "no_cookie"
+            if account and mode in {"api", "hybrid"}:
+                state = account.storage_state or account.creator_storage_state or ""
+                cookie = dy_cookie_from_state(state) or account.cookie
+                if cookie:
+                    ua = account.ua or self.cfg.engine.user_agent
+                    detail_context = validated_detail_context(
+                        get_setting(context_key(account_id), ""), account, state, ua)
+                    client = DouyinClient(cookie, ua, timeout=self.cfg.engine.request_timeout_seconds,
+                                          proxy=account.proxy, storage_state=state,
+                                          detail_context=detail_context, **douyin_client_environment(account))
+                    async with client.session_scope():
+                        detail = await client.fetch_video_detail(aweme_id) or {}
+                    title = clean_work_title(detail.get("desc"), aweme_id)
+                    if title:
+                        return title, ""
+                    error = client.last_error or "missing_work_title"
+                    category, _ = classify_platform_error(error)
+                    if (category in {RiskCategory.AUTH, RiskCategory.RISK, RiskCategory.NETWORK}
+                            or error == "aweme_unavailable"):
+                        return "", error
+            if mode in {"browser", "hybrid"}:
+                identity, _ = self._identity_proxy(account)
+                detail, error = await fetch_douyin_video_detail(
+                    self.browser, identity, aweme_id, timeout_ms=3000)
+                title = clean_work_title(detail.get("desc"), aweme_id)
+                return title, error or ("" if title else "missing_work_title")
+            return "", error
+
+        title, _ = await self.guarded_read_pair(
+            account_id, OperationKind.READ_LIGHT, "comment-ai-title", read_detail, empty_result="")
+        return title
+
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
                       platform="douyin") -> int:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""

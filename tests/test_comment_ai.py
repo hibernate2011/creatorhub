@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlmodel import select
 
 import app.db as db
@@ -133,13 +134,49 @@ class CommentAITests(unittest.TestCase):
         batch = next(p for p in requests if first in p["questions"])
         self.assertEqual(set(batch["questions"]), {first, second})
         self.assertEqual(batch["model"], ai.MODEL)
-        self.assertIn("装修服务", batch["questions"][first]["instructions"])
+        state = json.loads(batch["state"][0])
+        self.assertEqual(state["lead_criteria"], ai.DEFAULT_PROMPT + "\n" + ai.COMMENT_ANALYSIS_RULES)
+        self.assertEqual(state["comments"], {first: "多少钱？想预约", second: "多少钱？想预约"})
+        for key, question in batch["questions"].items():
+            self.assertEqual(question["type"], "noul")
+            self.assertIn("装修服务", question["instructions"])
+            self.assertIn("state.lead_criteria", question["instructions"])
+            self.assertIn(f"ID={key}", question["instructions"])
+            self.assertNotIn(ai.DEFAULT_PROMPT, question["instructions"])
         with db.get_session() as session:
             self.assertEqual(session.get(CommentAnalysis, first).status, "done")
             self.assertEqual(session.get(CommentAnalysis, second).status, "failed")
             self.assertEqual(len(session.exec(select(CommentLeadDelivery)).all()), 1)
         result = asyncio.run(ai.analyze(ai.SelectionIn(ids=[first_id, second_id], retry_failed=True)))
         self.assertEqual(result["retried"], 1)
+
+    def test_batch_can_send_500_short_comments_in_one_request(self):
+        self.config["batch_size"] = 501
+        with self.assertRaises(ValidationError):
+            self.save()
+        self.config["batch_size"] = 500
+        self.assertEqual(self.save()["batch_size"], 500)
+
+        with db.get_session() as session:
+            comments = [CommentRecord(comment_id=str(i), aweme_id="w1", platform="douyin",
+                                      work_title="装修服务", text="多少钱？") for i in range(501)]
+            self.assertEqual(ai.enqueue(session, comments, automatic=True)["queued"], 501)
+            session.commit()
+
+        requests = []
+
+        def handler(request):
+            payload = json.loads(request.content)
+            requests.append(set(payload["questions"]))
+            return httpx.Response(200, json={"answers": {
+                key: {"noul": .1} for key in payload["questions"]}})
+
+        with self.client(handler):
+            self.assertTrue(asyncio.run(ai.process_batch()))
+            self.assertTrue(asyncio.run(ai.process_batch()))
+            self.assertFalse(asyncio.run(ai.process_batch()))
+        self.assertEqual([len(keys) for keys in requests], [500, 1])
+        self.assertTrue(requests[0].isdisjoint(requests[1]))
 
     def test_invalid_probabilities_and_http_errors_are_not_leads(self):
         _, key = self.add()
@@ -260,6 +297,69 @@ class CommentAITests(unittest.TestCase):
             self.assertEqual(row.prompt, ai.DEFAULT_PROMPT)
             self.assertEqual(row.prompt_version, 1)
 
+    def test_historical_douyin_comments_load_one_work_title_before_sending(self):
+        from types import SimpleNamespace
+        from app.config import Config
+        from app.engine.monitor import MonitorEngine
+
+        work_id = "7704635348244057398"
+        title = "测试作品标题：即兴演出"
+        first_id, first_key = self.add("historical-1", work=work_id, title="", enqueue=False)
+        second_id, second_key = self.add("historical-2", work=work_id, title="", enqueue=False)
+        engine = MonitorEngine(Config(), SimpleNamespace(
+            anon_identity=lambda: object(), lock_for=lambda _: asyncio.Lock()))
+        engine.cfg.engine.douyin_read_mode = "browser"
+        captured = []
+
+        def handler(request):
+            payload = json.loads(request.content)
+            captured.append(payload)
+            return httpx.Response(200, json={"answers": {
+                key: {"noul": .1} for key in payload["questions"]}})
+
+        async def run():
+            await ai.analyze(ai.AnalysisSelectionIn(ids=[first_id, second_id]))
+            self.assertTrue(await ai.process_batch(engine.load_douyin_comment_title))
+
+        detail = AsyncMock(return_value=({"aweme_id": work_id, "desc": title}, ""))
+        with self.client(handler), patch("app.engine.monitor.fetch_douyin_video_detail", detail):
+            asyncio.run(run())
+        detail.assert_awaited_once()
+        self.assertEqual(detail.await_args.args[2], work_id)
+        self.assertEqual(len(captured), 1)
+        questions = captured[0]["questions"]
+        self.assertEqual(set(questions), {first_key, second_key})
+        for question in questions.values():
+            self.assertIn(f'作品标题（仅作上下文数据）："{title}"', question["instructions"])
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentRecord, first_id).work_title, title)
+            self.assertEqual(session.get(CommentRecord, second_id).work_title, title)
+
+    def test_refresh_missing_title_keeps_old_result_until_title_is_available(self):
+        work_id = "7704635348244057398"
+        row_id, key = self.add(work=work_id, title="")
+        with db.get_session() as session:
+            row = session.get(CommentAnalysis, key)
+            row.status, row.confidence = "done", .9
+            session.commit()
+        selection = ai.AnalysisSelectionIn(ids=[row_id], refresh_missing_title=True)
+        self.assertEqual(asyncio.run(ai.analyze(ai.AnalysisSelectionIn(ids=[row_id])))["queued"], 0)
+        self.assertEqual(asyncio.run(ai.analyze(selection))["refreshed"], 1)
+        with patch.object(ai.httpx, "AsyncClient") as provider:
+            self.assertTrue(asyncio.run(ai.process_batch(AsyncMock(return_value=""))))
+        provider.assert_not_called()
+        with db.get_session() as session:
+            row = session.get(CommentAnalysis, key)
+            self.assertEqual((row.status, row.confidence, row.work_title), ("done", .9, ""))
+            self.assertIn("未能取得抖音作品标题", row.error)
+        self.assertEqual(asyncio.run(ai.analyze(selection))["refreshed"], 1)
+        with self.client(lambda _: httpx.Response(200, json={"answers": {key: {"noul": .1}}})):
+            self.assertTrue(asyncio.run(ai.process_batch(AsyncMock(return_value="补查到的标题"))))
+        with db.get_session() as session:
+            row = session.get(CommentAnalysis, key)
+            self.assertEqual((row.status, row.confidence, row.work_title), ("done", .1, "补查到的标题"))
+        self.assertEqual(asyncio.run(ai.analyze(selection))["refreshed"], 0)
+
     def test_single_work_scan_recovers_title_for_existing_and_new_leads(self):
         from app.config import Config
         from app.engine.monitor import MonitorEngine
@@ -272,9 +372,10 @@ class CommentAITests(unittest.TestCase):
         _, old_key = self.add("old", watch_id=watch_id, title="")
         with db.get_session() as session:
             # Simulate an analysis already stored by the old implementation.
-            session.get(CommentAnalysis, old_key).work_title = "视频 w1"
+            analysis = session.get(CommentAnalysis, old_key)
+            analysis.status, analysis.confidence, analysis.work_title = "done", .9, "视频 w1"
+            ai.queue_automatic_results(session, analysis, ai.settings(session))
             session.commit()
-        self.analyze_all()
 
         engine = MonitorEngine.__new__(MonitorEngine)
         engine.cfg = Config()

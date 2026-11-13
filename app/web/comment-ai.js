@@ -9,20 +9,26 @@ function commentAIMarkup(row) {
   const score = ai.confidence == null ? '' : `<strong>潜客置信度 ${(ai.confidence * 100).toFixed(1)}%</strong>`;
   const deliveries = (ai.deliveries || []).map(d => `<span title="${esc(d.error || '')}">${esc(d.name || d.destination_id)}：${d.status === 'failed' ? '转发失败' : esc(COMMENT_AI_LABELS[d.status] || d.status)}${d.status === 'failed' ? ` <button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('forward',true,${row.id})">${ic("i-refresh")}重试转发</button>` : ''}</span>`).join(' · ');
   const retry = ai.status === 'failed' ? `<button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',true,${row.id})">${ic("i-refresh")}重试分析</button>` : '';
+  const refreshTitle = ai.can_refresh_title ? `<button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',false,${row.id},true)">${ic("i-refresh")}补标题并重新分析</button>` : '';
   return `<div class="comment-record-ai" title="${esc(ai.error || '')}"><div class="comment-record-ai-summary">
     <span class="comment-record-ai-status" data-status="${esc(ai.status)}">${esc(COMMENT_AI_LABELS[ai.status] || ai.status)}</span>${score}
-    ${ai.prompt_id ? `<span>${esc(ai.prompt_name || ai.prompt_id)} v${ai.prompt_version}</span>` : ''}${retry}</div>
-    ${retry && ai.error ? `<div>${esc(ai.error)}</div>` : ''}${deliveries ? `<div>${deliveries}</div>` : ''}</div>`;
+    ${ai.prompt_id ? `<span>${esc(ai.prompt_name || ai.prompt_id)} v${ai.prompt_version}</span>` : ''}${retry}${refreshTitle}</div>
+    ${ai.error ? `<div>${esc(ai.error)}</div>` : ''}${deliveries ? `<div>${deliveries}</div>` : ''}</div>`;
 }
 
-async function commentAIAction(action, retry = false, id = null) {
+async function commentAIAction(action, retry = false, id = null, refreshTitle = false) {
   const ids = id == null ? [...selComment] : [id];
   if (!ids.length) return toast('请先选择评论', 'err');
   if (retry && !await uiConfirm({title: action === 'analyze' ? '重试失败分析' : '重试失败转发',
     message: action === 'analyze' ? '若上次请求超时，远端可能已计费。仅重试失败项，成功结果会保留。' : '若上次请求超时，群里可能已收到消息，请核对后重试。', okText: '重试'})) return;
   try {
-    const result = await api(`/api/comment-ai/${action}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ids, retry_failed: retry})});
-    toast(action === 'analyze' ? `已入队 ${result.queued + (result.retried || 0)} 条；已有结果或已在队列的评论会跳过` : `已入队 ${result.queued} 条转发；仅处理达到各目标阈值且未成功转发的评论`, 'ok');
+    const body = {ids, retry_failed: retry};
+    if (refreshTitle) body.refresh_missing_title = true;
+    const result = await api(`/api/comment-ai/${action}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const message = refreshTitle ? `已入队 ${result.refreshed || 0} 条待补标题的分析`
+      : action === 'analyze' ? `已入队 ${result.queued + (result.retried || 0)} 条；已有结果或已在队列的评论会跳过`
+      : `已入队 ${result.queued} 条转发；仅处理达到各目标阈值且未成功转发的评论`;
+    toast(message, 'ok');
     await refreshComments();
     commentAIPoll();
   } catch (error) { toast(error.message, 'err'); }
@@ -155,11 +161,11 @@ async function openCommentAISettings() {
   const saved = await new Promise(resolve => {
     _uiResolve = resolve; _uiCancelVal = null; _uiGetVal = commentAIReadSettings;
     $('ui-body').innerHTML = `
-      <p class="mut">使用 google/gemini-decision-1 判断评论的潜客可能性。作品标题会作为上下文发送；成功分析的评论不会重复调用模型。</p>
+      <p class="mut">使用 google/gemini-decision-1 判断评论的潜客可能性。分析前会补查缺少标题的抖音作品，标题会随请求发送。</p>
       ${commentAIField('OpenRouter API Key', `<input id="cai-key" type="password" autocomplete="new-password" value="${esc(config.api_key)}">`)}
       <label style="display:block;margin:10px 0"><input id="cai-auto" type="checkbox" ${config.auto_analyze ? 'checked' : ''}>抓取新评论后自动分析</label>
       <label style="display:block;margin:10px 0"><input id="cai-forward" type="checkbox" ${config.auto_forward ? 'checked' : ''}>分析完成后按各目标阈值自动转发</label>
-      ${commentAIField('同作品每批最多评论数（1–100）', `<input id="cai-batch" type="number" min="1" max="100" value="${config.batch_size}">`)}
+      ${commentAIField('同作品每批最多评论数（1–500）', `<input id="cai-batch" type="number" min="1" max="500" value="${config.batch_size}">`)}
       <p class="mut">提示词匹配顺序：作品 ID → 指定监控任务 → 分组 → 默认。同级规则优先使用列表中靠前的规则。修改会创建新版本，仅影响之后入队的评论。</p>
       <div id="cai-prompts"></div><button class="ghost sm wb-secondary-action" type="button" onclick="commentAIAddPrompt()">${ic("i-plus")}添加领域提示词</button>
       <p class="mut">每个群机器人可单独设置阈值。已成功转发的评论不会重复发送到同一目标。******** 表示保留已配置的密钥，清空字段会删除该值。</p>
