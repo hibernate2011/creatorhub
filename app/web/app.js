@@ -463,7 +463,7 @@ function focusAdjacentControl(origin, backwards = false) {
 }
 function enhanceSelect(sel) {
   // React owns the assistant's native controls; reparenting them breaks updates.
-  if (sel.dataset.cs || sel.closest(".agent-workspace")) return;
+  if (sel.dataset.cs || sel.multiple || sel.closest(".agent-workspace")) return;
   sel.dataset.cs = "1";
   const wrap = document.createElement("div");
   wrap.className = "cs" + (sel.className ? " " + sel.className : "");
@@ -959,6 +959,9 @@ function _moduleReportParams(module, full) {
     put("ip_label", $("comment-ip-label") && $("comment-ip-label").value);
     put("reply_type", $("comment-type") && $("comment-type").value);
     put("min_like_count", $("comment-min-likes") && $("comment-min-likes").value);
+    put("ai_status", $("comment-ai-status")?.value);
+    const confidence = $("comment-min-confidence")?.value;
+    if (confidence !== '' && confidence != null) put("min_confidence", Number(confidence) / 100);
     put("sort", $("comment-sort") && $("comment-sort").value);
     for (const [key, value] of Object.entries(contentCaptureBounds("comment"))) put(key, value);
   } else if (module === "danmaku-watches") {
@@ -2330,7 +2333,7 @@ function showWatchRecords(kind, id) {
   const view = watchRecordConfig(kind);
   if (kind === "comment") { COMMENT_SRC = value; COMMENT_GROUP = COMMENT_TAG = ""; selComment.clear(); }
   else DANMAKU_SRC = value;
-  for (const suffix of ["query", "group", "tag", "type", "min-likes", "time-start", "time-end", "captured-from", "captured-to"]) {
+  for (const suffix of ["query", "group", "tag", "type", "min-likes", "ai-status", "min-confidence", "time-start", "time-end", "captured-from", "captured-to"]) {
     const node = $(kind + "-" + suffix); if (node) { node.value = ""; node._csSync?.(); }
   }
   if ($(kind + "-sort")) { $(kind + "-sort").value = "captured_desc"; $(kind + "-sort")._csSync?.(); }
@@ -6538,6 +6541,7 @@ function commentSelAllToggle() {
 function commentSelClear() { selComment.clear(); const sa = $("comment-selall"); if (sa) sa.checked = false; refreshComments(); }
 function updateCommentSelBar() {
   const n = selComment.size; const c = $("comment-selcount"), b = $("comment-batchbtn");
+  for (const id of ["comment-analyze", "comment-forward"]) { if ($(id)) $(id).disabled = !n; }
   c.textContent = "已选 " + n; c.style.display = n ? "inline" : "none"; b.style.display = n ? "inline-flex" : "none";
   const ids = [...document.querySelectorAll(COMMENT_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
   const allSel = ids.length > 0 && ids.every(id => selComment.has(id));
@@ -7299,6 +7303,7 @@ async function editWatchMeta(id) {
       recent_works: $("ew-recent") ? +$("ew-recent").value : item.recent_works || 0,
       recent_days: $("ew-days") ? +$("ew-days").value : item.recent_days || 0,
       max_scrolls: $("ew-depth") ? +$("ew-depth").value : item.max_scrolls || 0,
+      ai_policy: readWatchAIFields(item.ai_policy),
     });
     $("ui-body").innerHTML = `
       <fieldset class="monitor-config-group">
@@ -7325,7 +7330,8 @@ async function editWatchMeta(id) {
         </div>` : ""}
         ${item.platform === "xhs" ? "" : `<div><label class="field" for="ew-depth">评论区抓取深度</label>
           <select id="ew-depth">${depthOptions}</select></div>`}
-      </fieldset>`;
+      </fieldset>${watchAIFields(item.ai_policy || {})}`;
+    setupWatchAIFields(item.ai_policy);
     enhanceMetaControl($("ew-group"), "group"); enhanceMetaControl($("ew-tags"), "tags");
     setMetaValue("ew-group", item.group_name || ""); setMetaValue("ew-tags", itemTags(item).join(","));
     setupMonitorInterval("ew-interval", item.interval_seconds || 600);
@@ -7431,6 +7437,10 @@ async function refreshComments(resetPage = false) {
   const ipLabel = (($('comment-ip-label') && $('comment-ip-label').value) || "").trim();
   const replyType = ($('comment-type') && $('comment-type').value) || "";
   const minLikes = +(($('comment-min-likes') && $('comment-min-likes').value) || 0);
+  const aiStatus = $('comment-ai-status')?.value;
+  const confidence = $('comment-min-confidence')?.value;
+  if (aiStatus) params.set('ai_status', aiStatus);
+  if (confidence !== '' && confidence != null) params.set('min_confidence', String(Number(confidence) / 100));
   if (query) params.set("q", query);
   if (ipLabel) params.set("ip_label", ipLabel);
   if (replyType) params.set("reply_type", replyType);
@@ -7453,7 +7463,7 @@ async function refreshComments(resetPage = false) {
   $("comment-table").innerHTML = rows.map(r => {
     return `<tr>
     <td class="watch-record-check"><label class="watch-record-selection" title="选择这条评论"><input type="checkbox" data-id="${r.id}" aria-label="选择这条评论" onchange="commentToggleOne(${r.id}, this.checked)" ${selComment.has(r.id) ? "checked" : ""}></label></td>
-    <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}</td>
+    <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}${typeof commentAIMarkup === 'function' ? commentAIMarkup(r) : ''}</td>
     <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}${r.ip_label ? ` · ${esc(r.ip_label)}` : ""}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
     <td class="mut num watch-record-likes" data-label="赞">${fmtNum(r.like_count)}</td>
     <td class="watch-record-time">${watchRecordTimeMarkup("comment", r)}</td>

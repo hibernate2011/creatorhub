@@ -3356,6 +3356,7 @@
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-list"/></svg></span>
         <h2>评论监控列表</h2>
+        <button type="button" class="ghost sm wb-secondary-action" onclick="openCommentAISettings()"><svg aria-hidden="true"><use href="#i-settings"/></svg>AI 潜客分析配置</button>
       </div>
       <div class="manage-toolbar">
       <input type="search" id="watch-search" placeholder="搜索对象或别名" aria-label="搜索评论监控" oninput="onWatchFilter()">
@@ -3407,6 +3408,11 @@
           <option value="">全部评论</option><option value="top">仅主评论</option><option value="reply">仅回复</option>
         </select>
         <input id="comment-min-likes" type="number" min="0" step="1" placeholder="最低点赞" aria-label="评论最低点赞数" onchange="refreshComments(true)">
+        <select id="comment-ai-status" onchange="refreshComments(true)" aria-label="AI 分析状态">
+          <option value="">全部分析状态</option><option value="unanalyzed">未分析</option><option value="queued">等待分析</option>
+          <option value="processing">分析中</option><option value="done">已分析</option><option value="failed">分析失败</option>
+        </select>
+        <input id="comment-min-confidence" type="number" min="0" max="100" step="1" placeholder="最低潜客置信度 %" aria-label="最低潜客置信度百分比" onchange="refreshComments(true)">
         <select id="comment-sort" onchange="refreshComments(true)" aria-label="评论排序">
           <option value="captured_desc">最近抓取</option><option value="captured_asc">最早抓取</option>
           <option value="latest">最新评论</option><option value="oldest">最早评论</option><option value="likes_desc">点赞最多</option>
@@ -3419,6 +3425,11 @@
           <button class="sm danger" id="comment-batchbtn" style="display:none" onclick="commentBatchDelete()"><svg><use href="#i-trash"/></svg>批量删除</button>
           <button class="ghost sm danger" onclick="clearComments()"><svg><use href="#i-trash"/></svg>清空评论</button>
         </div>
+    </div>
+    <div role="group" aria-label="AI 潜客分析操作" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0">
+      <button type="button" class="sm" id="comment-analyze" disabled onclick="commentAIAction('analyze')"><svg aria-hidden="true"><use href="#i-bolt"/></svg>分析所选</button>
+      <button type="button" class="ghost sm wb-secondary-action" id="comment-forward" disabled onclick="commentAIAction('forward')"><svg aria-hidden="true"><use href="#i-send"/></svg>按阈值转发所选</button>
+      <button type="button" class="ghost sm wb-secondary-action" onclick="openCommentAISettings()"><svg aria-hidden="true"><use href="#i-settings"/></svg>AI 配置</button>
     </div>
     <div class="table-wrap" id="comment-table-wrap"><table class="watch-record-table comment-record-table" aria-label="已抓取评论、来源任务与抓取时间"><thead><tr>
       <th style="width:30px"><input type="checkbox" id="comment-selall" onchange="commentToggleAll(this.checked)" aria-label="全选"></th>
@@ -3884,6 +3895,7 @@
 <script src="/static/submissions.js"></script>
 <script src="/static/engine-settings.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/comment-ai.js"></script>
 <script src="/static/workspace-ui.js"></script>
 <script src="/static/workbench.js"></script>
 </body>

@@ -68,15 +68,16 @@ button.ghost { box-shadow:none; }
 .page-context h2 { font-size:25px; font-weight:700; letter-spacing:-.01em; line-height:1.3; color:var(--fg-strong); }
 .page-desc { font-size:13.5px; color:var(--mut); line-height:1.65; margin:6px 0 0; }
 .wb-page-actions { display:flex; align-items:center; gap:10px; flex-shrink:0; }
-.wb-page-actions button.ghost {
+.wb-page-actions button.ghost, button.ghost.wb-secondary-action {
   background:var(--glass-bg);
   border:1px solid var(--glass-border);
   box-shadow:var(--glass-specular),var(--sh-sm);
 }
-.wb-page-actions button.ghost:hover {
+.wb-page-actions button.ghost:hover, button.ghost.wb-secondary-action:hover:not(:disabled) {
   background:var(--surface);
   border-color:color-mix(in srgb,var(--line) 80%,var(--fg));
 }
+button.ghost.wb-secondary-action:focus-visible { box-shadow:0 0 0 3px var(--acc-ring); }
 .wb-icon-button { width:40px; min-width:40px; height:40px; padding:9px; display:inline-flex; align-items:center; justify-content:center; }
 .wb-icon-button svg, .wb-more svg { width:18px; height:18px; flex:0 0 auto; }
 #workbench-connection:empty { display:none; }

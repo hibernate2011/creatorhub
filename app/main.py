@@ -627,7 +627,11 @@ async def lifespan(app: FastAPI):
                 print(f"[webhook] 事件投递循环异常: {exc!r}")
             await asyncio.sleep(15)
     _webhook_delivery_task = asyncio.create_task(webhook_delivery_loop())
+    from .comment_ai import worker as comment_ai_worker
+    comment_ai_task = asyncio.create_task(comment_ai_worker())
     yield
+    comment_ai_task.cancel()
+    await asyncio.gather(comment_ai_task, return_exceptions=True)
     await shutdown_agent()
     if _webhook_delivery_task:
         _webhook_delivery_task.cancel()
@@ -648,6 +652,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CreatorHub", lifespan=lifespan)
+from .comment_ai import (
+    WatchAISettings, public_watch_policy, router as comment_ai_router, save_watch_policy,
+)
+app.include_router(comment_ai_router)
 app.add_middleware(LocalAccessMiddleware)
 WEB_DIR = Path(__file__).parent / "web"
 
@@ -8820,11 +8828,14 @@ async def export_comments_report(
     full: bool = False,
     captured_from: datetime | None = None,
     captured_before: datetime | None = None,
+    ai_status: str = "",
+    min_confidence: float | None = None,
 ):
     from .reporting import build_comments_report
 
     if full:
         watch_id = aweme_id = None
+        ai_status, min_confidence = "", None
         group_name = tag = q = ip_label = reply_type = ""
         min_like_count = 0
         sort = "latest"
@@ -8849,6 +8860,8 @@ async def export_comments_report(
                             and _meta_matches(w, group_name, tag)]
 
         stmt = _watch_record_filter(select(CommentRecord), CommentRecord, watch_id)
+        from .comment_ai import filter_analysis
+        stmt = filter_analysis(stmt, ai_status, min_confidence)
         if platform:
             stmt = stmt.where(CommentRecord.platform == platform)
         if aweme_id:
@@ -8885,6 +8898,7 @@ async def export_comments_report(
             ("分组", group_name), ("标签", tag), ("搜索", q),
             ("地区", ip_label),
             ("评论类型", reply_type), ("最低点赞", min_like_count or ""),
+            ("AI 分析状态", ai_status), ("最低潜客置信度", min_confidence),
             ("排序", sort), ("采集开始", start_date.isoformat() if start_date else ""),
             ("采集结束", end_date.isoformat() if end_date else ""),
             ("抓取起点 UTC（含）", captured_from.isoformat() if captured_from else ""),
@@ -9246,6 +9260,7 @@ class WatchUpdate(BaseModel):
     alias: str | None = None
     group_name: str | None = None
     tags: list[str] | None = None
+    ai_policy: WatchAISettings | None = None
 
 
 def _watch_dict(w: CommentWatch) -> dict:
@@ -9258,6 +9273,7 @@ def _watch_dict(w: CommentWatch) -> dict:
         "account_id": w.account_id, "interval_seconds": w.interval_seconds,
         "recent_works": w.recent_works, "recent_days": w.recent_days,
         "max_scrolls": w.max_scrolls,
+        "ai_policy": public_watch_policy(w),
         "enabled": w.enabled, "comment_count": w.comment_count,
         "last_scan_at": w.last_scan_at.isoformat() if w.last_scan_at else None,
         "next_auto_run_at": utc_iso(row_deadline(w, cfg, kind="comment_watch")),
@@ -9455,6 +9471,8 @@ async def update_watch(wid: int, body: WatchUpdate):
             w.group_name = _meta_text(body.group_name, 40)
         if body.tags is not None:
             w.tags = _dump_meta_tags(_meta_tags(body.tags))
+        if body.ai_policy is not None:
+            save_watch_policy(s, w, body.ai_policy)
         s.add(w); s.commit(); s.refresh(w)
         return _watch_dict(w)
 
@@ -9539,8 +9557,12 @@ def _watch_records(session, rows, model):
     ids = {row.watch_id for row in rows if row.watch_id and row.watch_id > 0}
     watches = {w.id: w for w in session.exec(select(model).where(model.id.in_(ids))).all()} if ids else {}
     serialize = _comment_dict if model is CommentWatch else _danmaku_dict
-    return [serialize(row, _watch_source(row.watch_id, row.platform, model, watches.get(row.watch_id)))
-            for row in rows]
+    items = [serialize(row, _watch_source(row.watch_id, row.platform, model, watches.get(row.watch_id)))
+             for row in rows]
+    if model is CommentWatch:
+        from .comment_ai import attach_analysis
+        attach_analysis(session, rows, items)
+    return items
 
 
 # ─────────── 评论数据 ───────────
@@ -9548,6 +9570,7 @@ def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
     return {
         "id": c.id, "watch_id": c.watch_id, "aweme_id": c.aweme_id,
         "comment_id": c.comment_id, "text": c.text, "user_nickname": c.user_nickname,
+        "work_title": c.work_title,
         "user_sec_uid": c.user_sec_uid, "ip_label": c.ip_label,
         "like_count": c.like_count, "create_time": c.create_time,
         "is_reply": bool(c.reply_to),
@@ -9565,7 +9588,8 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
                         sort: str = "latest", page: int = 1,
                         page_size: int = 10, paginate: bool = False,
                         captured_from: datetime | None = None,
-                        captured_before: datetime | None = None):
+                        captured_before: datetime | None = None,
+                        ai_status: str = "", min_confidence: float | None = None):
     """Return captured comments with optional SQL filters and pagination."""
     limit = max(1, min(limit, 1000))
     page = max(1, page)
@@ -9574,6 +9598,8 @@ async def list_comments(limit: int = 100, watch_id: int | None = None,
     with get_session() as s:
         selected_source = _selected_watch_source(s, CommentWatch, watch_id, platform)
         stmt = _watch_record_filter(select(CommentRecord), CommentRecord, watch_id)
+        from .comment_ai import filter_analysis
+        stmt = filter_analysis(stmt, ai_status, min_confidence)
         stmt = _report_window(stmt, CommentRecord, start, end)
         if platform is not None:
             stmt = stmt.where(CommentRecord.platform == platform)

@@ -1,0 +1,448 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from fastapi import HTTPException
+from sqlmodel import select
+
+import app.db as db
+from app import comment_ai as ai
+from app.models import (CommentAnalysis, CommentLeadDelivery, CommentRecord,
+                        CommentWatch, ContentRecord, AccountWork)
+
+
+class CommentAITests(unittest.TestCase):
+    def setUp(self):
+        self.previous = db._engine
+        self.tmp = tempfile.TemporaryDirectory()
+        db.init_db(str(Path(self.tmp.name) / "test.db"))
+        with db.get_session() as session:
+            self.config = ai.settings(session)
+        self.config["api_key"] = "test-openrouter-key"
+        self.config["auto_analyze"] = True
+        self.config["auto_forward"] = True
+        self.config["destinations"] = [dict(id="sales", name="销售群", type="feishu",
+            webhook="https://open.feishu.cn/open-apis/bot/v2/hook/test-secret", secret="sign-secret", threshold=.8)]
+        self.save()
+
+    def tearDown(self):
+        db._engine.dispose()
+        db._engine = self.previous
+        self.tmp.cleanup()
+
+    def save(self):
+        return ai.save_settings(ai.SettingsIn(**self.config))
+
+    def add(self, comment_id="c1", work="w1", platform="douyin", watch_id=0, title="装修服务", enqueue=True):
+        with db.get_session() as session:
+            row = CommentRecord(comment_id=comment_id, aweme_id=work, platform=platform,
+                                watch_id=watch_id, work_title=title, text="多少钱？想预约", user_nickname="客户")
+            session.add(row)
+            if enqueue:
+                ai.enqueue(session, [row], automatic=True)
+            session.commit()
+            session.refresh(row)
+            return row.id, ai.analysis_id(row)
+
+    def client(self, handler):
+        original = httpx.AsyncClient
+        transport = httpx.MockTransport(handler)
+        return patch.object(ai.httpx, "AsyncClient", side_effect=lambda **kwargs: original(transport=transport, **kwargs))
+
+    def analyze_all(self, score=.9):
+        def handler(request):
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={"id": "provider-id", "answers": {
+                key: {"type": "noul", "noul": score} for key in payload["questions"]}})
+        async def run():
+            while await ai.process_batch():
+                pass
+        with self.client(handler):
+            asyncio.run(run())
+
+    def test_settings_secrets_versions_and_scope_precedence(self):
+        result = self.save()
+        self.assertEqual(result["api_key"], ai.MASK)
+        self.assertEqual(result["destinations"][0]["webhook"], ai.MASK)
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertEqual(result["prompts"][0]["version"], 1)
+        result["prompts"][0]["text"] = "新行业标准"
+        self.assertEqual(ai.save_settings(ai.SettingsIn(**result))["prompts"][0]["version"], 2)
+        with db.get_session() as session:
+            actual = ai.settings(session)
+        self.assertEqual(actual["api_key"], "test-openrouter-key")
+        self.assertEqual(actual["destinations"][0]["secret"], "sign-secret")
+        prompts = [ai.PromptIn(id="group", name="行业", text="g", groups=["装修"]).model_dump(),
+                   ai.PromptIn(id="watch", name="账号", text="w", watch_ids=[12]).model_dump(),
+                   ai.PromptIn(id="work", name="作品", text="v", work_ids=["w1"], platform="douyin").model_dump()]
+        actual["prompts"] += prompts
+        row = CommentRecord(aweme_id="w1", comment_id="c", watch_id=12)
+        watch = CommentWatch(group_name="装修")
+        self.assertEqual(ai.resolve_prompt(actual, row, watch)["id"], "work")
+        row.aweme_id = "other"
+        self.assertEqual(ai.resolve_prompt(actual, row, watch)["id"], "watch")
+        row.watch_id = 13
+        self.assertEqual(ai.resolve_prompt(actual, row, watch)["id"], "group")
+        self.assertEqual(ai.resolve_prompt(actual, row, None)["id"], "default")
+
+    def test_invalid_settings_do_not_replace_stored_credentials(self):
+        self.config["destinations"][0]["webhook"] = "https://example.com/robot"
+        with self.assertRaises(HTTPException):
+            self.save()
+        with db.get_session() as session:
+            self.assertIn("open.feishu.cn", ai.settings(session)["destinations"][0]["webhook"])
+
+    def test_dedup_across_watches_and_after_deletion_and_platform_isolation(self):
+        row_id, key = self.add(watch_id=1)
+        _, other = self.add(watch_id=2)
+        self.assertEqual(key, other)
+        self.add(platform="xhs")
+        self.analyze_all()
+        with db.get_session() as session:
+            session.delete(session.get(CommentRecord, row_id))
+            session.commit()
+        new_id, _ = self.add(watch_id=3)
+        result = asyncio.run(ai.analyze(ai.SelectionIn(ids=[new_id], retry_failed=True)))
+        self.assertEqual(result["queued"], 0)
+        self.assertEqual(result["retried"], 0)
+        with db.get_session() as session:
+            self.assertEqual(len(session.exec(select(CommentAnalysis)).all()), 2)
+            self.assertEqual(session.get(CommentAnalysis, key).confidence, .9)
+
+    def test_batch_context_partial_response_concurrent_claim_and_no_implicit_retry(self):
+        first_id, first = self.add(comment_id="1")
+        second_id, second = self.add(comment_id="2")
+        _, third = self.add(comment_id="3", work="other")
+        requests = []
+        async def handler(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            await asyncio.sleep(.02)
+            return httpx.Response(200, json={"answers": {first: {"noul": .9}, third: {"noul": .2}}})
+        async def run():
+            await asyncio.gather(ai.process_batch(), ai.process_batch())
+        with self.client(handler):
+            asyncio.run(run())
+            self.assertFalse(asyncio.run(ai.process_batch()))
+        self.assertEqual(len(requests), 2)
+        batch = next(p for p in requests if first in p["questions"])
+        self.assertEqual(set(batch["questions"]), {first, second})
+        self.assertEqual(batch["model"], ai.MODEL)
+        self.assertIn("装修服务", batch["questions"][first]["instructions"])
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentAnalysis, first).status, "done")
+            self.assertEqual(session.get(CommentAnalysis, second).status, "failed")
+            self.assertEqual(len(session.exec(select(CommentLeadDelivery)).all()), 1)
+        result = asyncio.run(ai.analyze(ai.SelectionIn(ids=[first_id, second_id], retry_failed=True)))
+        self.assertEqual(result["retried"], 1)
+
+    def test_invalid_probabilities_and_http_errors_are_not_leads(self):
+        _, key = self.add()
+        for score in (True, -1, 1.1, "0.9", None):
+            with db.get_session() as session:
+                row = session.get(CommentAnalysis, key)
+                row.status = "queued"
+                session.add(row)
+                session.commit()
+            with self.client(lambda request: httpx.Response(200, json={"answers": {key: {"noul": score}}})):
+                asyncio.run(ai.process_batch())
+            with db.get_session() as session:
+                self.assertEqual(session.get(CommentAnalysis, key).status, "failed")
+                self.assertFalse(session.exec(select(CommentLeadDelivery)).all())
+
+    def test_forward_failure_is_independent_and_success_is_never_resent(self):
+        row_id, key = self.add()
+        self.analyze_all()
+        with patch.object(ai, "send_one", AsyncMock(return_value=(False, "failed sign-secret"))) as send:
+            asyncio.run(ai.process_delivery())
+            self.assertEqual(send.await_count, 1)
+        with db.get_session() as session:
+            delivery = session.get(CommentLeadDelivery, key + ":sales")
+            self.assertNotIn("sign-secret", delivery.error)
+            self.assertEqual(session.get(CommentAnalysis, key).status, "done")
+        asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id], retry_failed=True)))
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            asyncio.run(ai.process_delivery())
+            asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id], retry_failed=True)))
+            asyncio.run(ai.process_delivery())
+            self.assertEqual(send.await_count, 1)
+            self.assertIn("装修服务", send.call_args.args[3])
+
+    def test_lead_message_links_and_omits_internal_fields(self):
+        row = CommentAnalysis(id="a", platform="douyin", aweme_id="work", comment_id="private-comment",
+            user_sec_uid="profile-id", user_nickname="客户", text="咨询", work_title="作品标题",
+            confidence=.85, prompt_name="internal-prompt")
+        text = ai.lead_text(row)
+        self.assertIn("作品链接：https://www.douyin.com/video/work", text)
+        self.assertIn("用户主页：https://www.douyin.com/user/profile-id", text)
+        self.assertNotIn("private-comment", text)
+        self.assertNotIn("internal-prompt", text)
+        self.assertNotIn("用户 ID：", text)
+        row.platform = "tiktok"
+        row.user_profile_url = "https://www.tiktok.com/@customer"
+        self.assertIn("用户主页：https://www.tiktok.com/@customer", ai.lead_text(row))
+        row.user_profile_url = ""
+        self.assertNotIn("用户主页：", ai.lead_text(row))
+        self.assertIn("用户 ID：profile-id", ai.lead_text(row))
+        row.user_sec_uid = ""
+        self.assertNotIn("用户 ID：", ai.lead_text(row))
+
+    def test_comment_parsers_capture_profile_identifiers(self):
+        from app.platforms.xhs.extract import parse_comment as parse_xhs
+        from app.platforms.kuaishou.extract import parse_ks_comment
+        from app.platforms.tiktok.extract import parse_tiktok_comment
+        self.assertEqual(parse_xhs({"id": "c", "user_info": {"user_id": "xhs-user"}})["user_sec_uid"], "xhs-user")
+        self.assertEqual(parse_ks_comment({"commentId": "c", "authorId": "ks-user"})["user_sec_uid"], "ks-user")
+        parsed = parse_tiktok_comment({"id": "c", "user": {"uniqueId": "customer", "secUid": "secret-id"}})
+        self.assertEqual(parsed["user_profile_url"], "https://www.tiktok.com/@customer")
+        self.assertEqual(parsed["user_sec_uid"], "secret-id")
+
+    def test_threshold_boundary_and_disabled_destination(self):
+        row_id, key = self.add()
+        self.analyze_all(.8)
+        self.config["destinations"][0]["enabled"] = False
+        self.save()
+        with patch.object(ai, "send_one", AsyncMock()) as send:
+            asyncio.run(ai.process_delivery())
+            send.assert_not_called()
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentLeadDelivery, key + ":sales").status, "skipped")
+
+    def test_auto_ingest_persists_title_and_queue_atomically(self):
+        from app.engine.monitor import MonitorEngine
+        engine = MonitorEngine.__new__(MonitorEngine)
+        count = asyncio.run(engine._ingest(42, "w1", [{"comment_id": "c1", "text": "预约", "create_time": 1}],
+                                         "账号昵称", "作品真实标题", True))
+        self.assertEqual(count, 1)
+        with db.get_session() as session:
+            row = session.exec(select(CommentRecord)).one()
+            self.assertEqual(row.work_title, "作品真实标题")
+            self.assertEqual(session.get(CommentAnalysis, ai.analysis_id(row)).work_title, "作品真实标题")
+        self.config["auto_analyze"] = False
+        self.save()
+        row_id, key = self.add("manual")
+        with db.get_session() as session:
+            self.assertIsNone(session.get(CommentAnalysis, key))
+        self.assertEqual(asyncio.run(ai.analyze(ai.SelectionIn(ids=[row_id])))["queued"], 1)
+
+    def test_title_fallback_and_prompt_snapshot(self):
+        with db.get_session() as session:
+            session.add(AccountWork(platform="douyin", account_id=1, item_id="w1", desc="自有作品标题"))
+            session.commit()
+        _, key = self.add(title="")
+        self.config["prompts"][0]["text"] = "新提示词"
+        self.save()
+        with db.get_session() as session:
+            row = session.get(CommentAnalysis, key)
+            self.assertEqual(row.work_title, "自有作品标题")
+            self.assertEqual(row.prompt, ai.DEFAULT_PROMPT)
+            self.assertEqual(row.prompt_version, 1)
+
+    def test_stale_requests_are_held_not_automatically_repeated(self):
+        _, key = self.add()
+        with db.get_session() as session:
+            row = session.get(CommentAnalysis, key)
+            row.status = "processing"
+            row.updated_at = datetime.utcnow() - timedelta(minutes=10)
+            session.add(row)
+            session.commit()
+        ai.recover_stale()
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentAnalysis, key).status, "failed")
+        self.assertFalse(asyncio.run(ai.process_batch()))
+
+    def test_list_filters_pagination_and_unanalyzed(self):
+        from app.main import list_comments
+        self.add("a")
+        self.add("b")
+        self.analyze_all(.81)
+        self.add("c", enqueue=False)
+        result = asyncio.run(list_comments(min_confidence=.8, paginate=True, page_size=1))
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["items"][0]["ai"]["confidence"], .81)
+        self.assertEqual(len(asyncio.run(list_comments(ai_status="unanalyzed"))), 1)
+        self.assertEqual(len(asyncio.run(list_comments(min_confidence=.9))), 0)
+
+    def test_feishu_signature_and_application_errors(self):
+        from app.notifier import send_one
+        captured = []
+        def handler(request):
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json={"code": 19024, "msg": "invalid signature"})
+        with self.client(handler):
+            ok, _ = asyncio.run(send_one("feishu", self.config["destinations"][0], "线索", "测试"))
+        self.assertFalse(ok)
+        self.assertTrue(captured[0]["timestamp"])
+        self.assertTrue(captured[0]["sign"])
+        self.assertEqual(captured[0]["msg_type"], "text")
+
+    def test_api_contract_validation_and_redaction(self):
+        from app.main import app
+        row_id, _ = self.add(enqueue=False)
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+                response = await client.get("/api/comment-ai/settings")
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("test-openrouter-key", response.text)
+                self.assertEqual((await client.put("/api/comment-ai/settings", json=response.json())).status_code, 200)
+                self.assertEqual((await client.post("/api/comment-ai/analyze", json={"ids": []})).status_code, 422)
+                accepted = await client.post("/api/comment-ai/analyze", json={"ids": [row_id]})
+                self.assertEqual(accepted.status_code, 202)
+                self.assertEqual(accepted.json()["queued"], 1)
+                self.assertEqual((await client.get("/api/comments?min_confidence=2")).status_code, 422)
+        asyncio.run(run())
+
+    def test_existing_database_migration_preserves_comment(self):
+        from sqlalchemy import text, inspect
+        row_id, _ = self.add(enqueue=False)
+        with db._engine.begin() as connection:
+            connection.execute(text("ALTER TABLE commentrecord DROP COLUMN work_title"))
+        db._engine.dispose()
+        db.init_db(str(Path(self.tmp.name) / "test.db"))
+        self.assertIn("work_title", {c["name"] for c in inspect(db._engine).get_columns("commentrecord")})
+        with db.get_session() as session:
+            row = session.get(CommentRecord, row_id)
+            self.assertEqual(row.text, "多少钱？想预约")
+            self.assertEqual(row.work_title, "")
+
+    def test_provider_error_is_redacted_and_requires_explicit_retry(self):
+        _, key = self.add()
+        with self.client(lambda request: httpx.Response(401, text="echo test-openrouter-key")):
+            asyncio.run(ai.process_batch())
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentAnalysis, key).error, "OpenRouter HTTP 401")
+        self.assertFalse(asyncio.run(ai.process_batch()))
+        self.assertNotIn("test-secret", ai.redact_detail("feishu", self.config["destinations"][0], "invalid test-secret"))
+
+    def test_export_matches_confidence_filter(self):
+        from app.main import export_comments_report
+        self.add()
+        self.analyze_all(.9)
+        self.add("unanalyzed", enqueue=False)
+        with patch("app.reporting.build_comments_report", return_value=b"xlsx") as report:
+            asyncio.run(export_comments_report(min_confidence=.8))
+            self.assertEqual(len(report.call_args.args[0]), 1)
+            asyncio.run(export_comments_report(min_confidence=.8, full=True))
+            self.assertEqual(len(report.call_args.args[0]), 2)
+
+    def test_bulk_delivery_is_paced_per_destination(self):
+        self.add("one")
+        self.add("two")
+        self.analyze_all()
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            self.assertFalse(asyncio.run(ai.process_delivery()))
+            self.assertEqual(send.await_count, 1)
+            with db.get_session() as session:
+                sent = session.exec(select(CommentLeadDelivery).where(CommentLeadDelivery.status == "sent")).one()
+                sent.updated_at = datetime.utcnow() - timedelta(seconds=4)
+                session.add(sent)
+                session.commit()
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            self.assertEqual(send.await_count, 2)
+
+    def test_watch_override_uses_custom_channel_and_reuses_analysis_across_watches(self):
+        from app.main import WatchUpdate, update_watch
+        self.config.update(auto_analyze=False, auto_forward=False)
+        self.save()
+        with db.get_session() as session:
+            watches = [CommentWatch(title=name) for name in ("全局", "门店一", "门店二")]
+            session.add_all(watches)
+            session.commit()
+            inherited, first, second = [w.id for w in watches]
+        for watch_id in (first, second):
+            destination = {**self.config["destinations"][0], "webhook":
+                           f"https://open.feishu.cn/open-apis/bot/v2/hook/branch-{watch_id}"}
+            body = WatchUpdate(ai_policy=ai.WatchAISettings(auto_analyze="on", auto_forward="on",
+                                destination_mode="custom", destinations=[destination]))
+            saved = asyncio.run(update_watch(watch_id, body))
+            self.assertEqual(saved["ai_policy"]["destinations"][0]["webhook"], ai.MASK)
+            saved["ai_policy"]["destinations"][0]["threshold"] = .85
+            asyncio.run(update_watch(watch_id, WatchUpdate(ai_policy=saved["ai_policy"])))
+        self.add(watch_id=inherited, comment_id="global")
+        self.add(watch_id=first)
+        self.analyze_all()
+        self.add(watch_id=second)
+        with db.get_session() as session:
+            self.assertEqual(len(session.exec(select(CommentAnalysis)).all()), 1)
+            self.assertEqual({row.destination_id for row in session.exec(select(CommentLeadDelivery))},
+                             {f"watch:{first}:sales", f"watch:{second}:sales"})
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            self.assertEqual({call.args[1]["webhook"].rsplit("/", 1)[-1] for call in send.call_args_list},
+                             {f"branch-{first}", f"branch-{second}"})
+
+    def test_manual_forward_uses_target_channel_when_global_channels_are_empty(self):
+        self.config["destinations"] = []
+        self.config["auto_forward"] = False
+        self.save()
+        with db.get_session() as session:
+            watch = CommentWatch()
+            ai.save_watch_policy(session, watch, ai.WatchAISettings(
+                destination_mode="custom", destinations=[ai.DestinationIn(
+                    id="branch", name="门店群", type="feishu",
+                    webhook="https://open.feishu.cn/open-apis/bot/v2/hook/branch")]))
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        row_id, key = self.add(watch_id=watch_id)
+        self.analyze_all()
+        self.assertEqual(asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id])))["queued"], 1)
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            self.assertEqual(send.await_args.args[1]["name"], "门店群")
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentLeadDelivery, f"{key}:watch:{watch_id}:branch").status, "sent")
+
+    def test_watch_disable_blocks_automatic_work_and_pending_push(self):
+        from app.main import WatchUpdate, update_watch
+        with db.get_session() as session:
+            watch = CommentWatch(title="店铺")
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        _, first = self.add(watch_id=watch_id)
+        self.analyze_all()
+        asyncio.run(update_watch(watch_id, WatchUpdate(ai_policy=ai.WatchAISettings(
+            auto_analyze="off", auto_forward="off"))))
+        row_id, second = self.add(watch_id=watch_id, comment_id="later")
+        with patch.object(ai, "send_one", AsyncMock()) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            send.assert_not_called()
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentLeadDelivery, first + ":sales").status, "skipped")
+            self.assertIsNone(session.get(CommentAnalysis, second))
+        self.assertEqual(asyncio.run(ai.analyze(ai.SelectionIn(ids=[row_id])))["queued"], 1)
+        with self.assertRaises(HTTPException) as exc:
+            asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id])))
+        self.assertEqual(exc.exception.status_code, 422)
+
+    def test_worker_drains_analysis_and_delivery_without_foreground_request(self):
+        _, key = self.add()
+        def handler(request):
+            return httpx.Response(200, json={"answers": {key: {"noul": .95}}})
+        async def run():
+            task = asyncio.create_task(ai.worker())
+            try:
+                for _ in range(100):
+                    await asyncio.sleep(.01)
+                    with db.get_session() as session:
+                        delivery = session.get(CommentLeadDelivery, key + ":sales")
+                        if delivery and delivery.status == "sent":
+                            return
+                self.fail("worker did not drain the durable queue")
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        with self.client(handler), patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))):
+            asyncio.run(run())
+
+
+if __name__ == "__main__":
+    unittest.main()

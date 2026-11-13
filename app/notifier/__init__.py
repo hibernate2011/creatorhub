@@ -46,7 +46,7 @@ async def _send_dingtalk(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
     async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(webhook, json={"msgtype": "text", "text": {"content": content}})
         try:
-            ok = r.json().get("errcode", -1) == 0
+            ok = r.is_success and r.json().get("errcode", -1) == 0
         except Exception:
             ok = False
         return ok, r.text[:120]
@@ -65,7 +65,28 @@ async def _send_telegram(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
         return (r.status_code == 200), f"HTTP {r.status_code} {r.text[:80]}"
 
 
-_SENDERS = {"bark": _send_bark, "dingtalk": _send_dingtalk, "telegram": _send_telegram}
+async def _send_feishu(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
+    webhook = (cfg.get("webhook") or "").strip()
+    if not webhook:
+        return False, "缺少 webhook"
+    payload = {"msg_type": "text", "content": {"text": f"{cfg.get('keyword', '')} {title}\n{text}".strip()}}
+    secret = (cfg.get("secret") or "").strip()
+    if secret:
+        timestamp = str(int(time.time()))
+        payload.update(timestamp=timestamp, sign=base64.b64encode(hmac.new(
+            f"{timestamp}\n{secret}".encode(), b"", hashlib.sha256).digest()).decode())
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        response = await client.post(webhook, json=payload)
+        try:
+            result = response.json()
+            ok = response.is_success and result.get("code", result.get("StatusCode", -1)) == 0
+        except ValueError:
+            ok = False
+        return ok, response.text[:120]
+
+
+_SENDERS = {"bark": _send_bark, "dingtalk": _send_dingtalk, "telegram": _send_telegram,
+            "feishu": _send_feishu}
 CHANNEL_TYPES = tuple(_SENDERS.keys())
 
 

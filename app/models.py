@@ -337,6 +337,7 @@ class CommentWatch(SQLModel, table=True):
     alias: str = ""               # 管理别名
     group_name: str = Field(default="", index=True)  # 单一业务分组
     tags: str = ""                # JSON 字符串数组,用于多维筛选
+    ai_policy: str = "{}"          # JSON: 自动分析、推送和专用机器人
     mode: str = "public"           # public(公开评论区) | creator(创作中心,仅抖音自有账号)
     account_id: Optional[int] = None
     interval_seconds: int = 600
@@ -391,13 +392,56 @@ class CommentRecord(SQLModel, table=True):
     aweme_id: str = Field(index=True)
     comment_id: str = Field(index=True)        # 抖音 cid
     text: str = ""
+    work_title: str = ""                     # 抓取时保存作品标题，供潜客判断使用
     user_nickname: str = ""
-    user_sec_uid: str = ""                    # 抖音评论用户 sec_uid
+    user_sec_uid: str = ""                    # 评论用户的平台标识
+    user_profile_url: str = ""
     ip_label: str = ""                        # 平台返回的评论地区标签
     like_count: int = 0
     create_time: int = 0                       # 评论时间(unix 秒)
     reply_to: str = ""                         # 上级评论 cid(子评论时)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CommentAnalysis(SQLModel, table=True):
+    """Canonical ledger: one analysis per platform/work/comment, across watches."""
+    __table_args__ = (Index("ix_comment_analysis_identity", "platform", "aweme_id", "comment_id", unique=True),)
+    id: str = Field(primary_key=True)
+    platform: str = Field(index=True)
+    aweme_id: str = Field(index=True)
+    comment_id: str = Field(index=True)
+    watch_id: int = 0
+    text: str = ""
+    user_nickname: str = ""
+    user_sec_uid: str = ""
+    user_profile_url: str = ""
+    work_title: str = ""
+    prompt_id: str = "default"
+    prompt_name: str = ""
+    prompt_version: int = 1
+    prompt: str = ""
+    model: str = "google/gemini-decision-1"
+    status: str = Field(default="queued", index=True)
+    confidence: Optional[float] = Field(default=None, index=True)
+    error: str = ""
+    request_id: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class CommentLeadDelivery(SQLModel, table=True):
+    """Durable outbox; success is never resent to the same destination."""
+    __table_args__ = (Index("ix_comment_delivery_destination_time", "destination_id", "updated_at"),)
+    id: str = Field(primary_key=True)
+    analysis_id: str = Field(index=True)
+    destination_id: str = ""
+    watch_id: Optional[int] = None
+    automatic: bool = False
+    status: str = Field(default="pending", index=True)
+    attempts: int = 0
+    error: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class KeywordCollectionJob(SQLModel, table=True):

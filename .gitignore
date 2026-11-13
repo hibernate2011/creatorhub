@@ -8,6 +8,8 @@ coverage/
 htmlcov/
 test-results/
 playwright-report/
+/.playwright-cli/
+/output/playwright/
 
 # Local verification, rollback, and temporary agent outputs
 .analysis/

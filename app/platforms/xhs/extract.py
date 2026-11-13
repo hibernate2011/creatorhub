@@ -254,6 +254,7 @@ def parse_comment(raw: dict) -> Optional[dict]:
         "comment_id": cid,
         "text": (_first(raw, "content", "text", default="") or "").strip(),
         "user_nickname": _first(user, "nickname", "nick_name", "name", default="") or "",
+        "user_sec_uid": str(_first(user, "user_id", "userId", "id", default="") or ""),
         "like_count": _num(_first(raw, "like_count", "liked_count", default=0)),
         "create_time": int(_first(raw, "create_time", "createTime", default=0) or 0) // 1000
         if int(_first(raw, "create_time", "createTime", default=0) or 0) > 10_000_000_000

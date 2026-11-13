@@ -173,6 +173,7 @@ def parse_ks_comment(raw: dict) -> Optional[dict]:
         "text": (_first(raw, "content", "text", default="") or "").strip(),
         "user_nickname": _first(raw, "author_name", "authorName", "userName", "name",
                                 default="") or "",
+        "user_sec_uid": str(_first(raw, "author_id", "authorId", "user_id", "userId", default="") or ""),
         "like_count": _to_int(_first(raw, "likedCount", "realLikedCount", "like_count",
                                      "likeCount", default=0)),
         "create_time": create_time,

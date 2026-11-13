@@ -2966,6 +2966,7 @@ class MonitorEngine:
         # 去重落库(watch_id=0 = 本账号作品来源)
         added = 0
         with get_session() as s:
+            ai_rows = []
             for c in fresh:
                 cid = c.get("comment_id")
                 if not cid:
@@ -2976,8 +2977,12 @@ class MonitorEngine:
                     CommentRecord.comment_id == cid)).first()
                 if exists:
                     continue
-                s.add(CommentRecord(platform=platform, watch_id=0, aweme_id=item_id, **c))
+                record = CommentRecord(platform=platform, watch_id=0, aweme_id=item_id, **c)
+                s.add(record)
+                ai_rows.append(record)
                 added += 1
+            from ..comment_ai import enqueue
+            enqueue(s, ai_rows, automatic=True)
             s.commit()
         return {"ok": not error or added > 0, "fetched": len(fresh),
                 "added": added, "error": error, "source": source,
@@ -3212,9 +3217,14 @@ class MonitorEngine:
                            .where(CommentRecord.watch_id == watch_id)
                            .where(CommentRecord.aweme_id == aweme_id)).all()
             prev_max = max([t for t in times if t] or [0])
+            ai_rows = []
             for c in fresh:
-                s.add(CommentRecord(platform=platform, watch_id=watch_id,
-                                    aweme_id=aweme_id, **c))
+                record = CommentRecord(platform=platform, watch_id=watch_id,
+                                       aweme_id=aweme_id, **{**c, "work_title": work_desc or ""})
+                s.add(record)
+                ai_rows.append(record)
+            from ..comment_ai import enqueue
+            enqueue(s, ai_rows, automatic=True)
             s.commit()
         newer = [c for c in fresh if c["create_time"] > prev_max]
         if not first_scan and newer:
@@ -3472,8 +3482,13 @@ class MonitorEngine:
         if not fresh:
             return 0, None
         with get_session() as s:
+            ai_rows = []
             for c in fresh:
-                s.add(CommentRecord(watch_id=watch_id, **c))   # c 自带 aweme_id
+                record = CommentRecord(watch_id=watch_id, **c)   # c 自带 aweme_id
+                s.add(record)
+                ai_rows.append(record)
+            from ..comment_ai import enqueue
+            enqueue(s, ai_rows, automatic=True)
             s.commit()
         newer = [c for c in fresh if c["create_time"] > prev_max]
         if not first_scan and newer:

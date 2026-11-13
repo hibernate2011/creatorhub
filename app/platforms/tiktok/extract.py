@@ -7,7 +7,7 @@ import unicodedata
 from typing import Optional
 
 from ..douyin.extract import Aweme, MediaItem
-from .urls import video_url
+from .urls import video_url, profile_url, parse_profile_reference
 
 
 def _first(data: dict, *keys, default=None):
@@ -134,6 +134,7 @@ def parse_tiktok_comment(raw: dict, parent_id: str = "") -> Optional[dict]:
         "text": str(_first(raw, "text", "content", default="") or "").strip(),
         "user_nickname": str(_first(user, "nickname", "uniqueId", "unique_id", default="") or ""),
         "user_sec_uid": str(_first(user, "secUid", "sec_uid", "uid", "id", default="") or ""),
+        "user_profile_url": profile_url(username) if (username := parse_profile_reference(str(_first(user, "uniqueId", "unique_id", default="") or ""))) else "",
         "ip_label": str(_first(raw, "ip_label", "ipLabel", default="") or ""),
         "like_count": _int(_first(raw, "digg_count", "diggCount", "like_count", default=0)),
         "create_time": _int(_first(raw, "create_time", "createTime", default=0)),

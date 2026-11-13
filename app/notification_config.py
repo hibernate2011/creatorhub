@@ -65,6 +65,10 @@ def redact_detail(kind: str, config: dict, detail: str) -> str:
                 try:
                     url = urlsplit(value)
                     hidden.extend(v for _, v in parse_qsl(url.query) if v)
+                    if kind == "feishu" and key == "webhook":
+                        token = url.path.rstrip("/").rsplit("/", 1)[-1]
+                        if token:
+                            hidden.append(token)
                     hidden.extend(v for v in [url.username, url.password] if v)
                 except ValueError:
                     pass
