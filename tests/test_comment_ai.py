@@ -192,6 +192,21 @@ class CommentAITests(unittest.TestCase):
         row.user_sec_uid = ""
         self.assertNotIn("用户 ID：", ai.lead_text(row))
 
+    def test_delivery_comment_time_for_existing_and_deleted_records(self):
+        row_id, key = self.add()
+        with db.get_session() as session:
+            session.get(CommentRecord, row_id).create_time = 1700000000
+            session.commit()
+        self.analyze_all()
+        with patch.object(ai, "send_one", AsyncMock(return_value=(False, "failure"))) as send:
+            asyncio.run(ai.process_delivery())
+            self.assertIn("评论：多少钱？想预约\n评论时间：2023-11-15 06:13:20", send.call_args.args[3])
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentAnalysis, key).comment_create_time, 1700000000)
+            session.delete(session.get(CommentRecord, row_id))
+            session.commit()
+            self.assertIn("评论时间：2023-11-15 06:13:20", ai.lead_text(session.get(CommentAnalysis, key)))
+
     def test_comment_parsers_capture_profile_identifiers(self):
         from app.platforms.xhs.extract import parse_comment as parse_xhs
         from app.platforms.kuaishou.extract import parse_ks_comment
@@ -223,6 +238,7 @@ class CommentAITests(unittest.TestCase):
             row = session.exec(select(CommentRecord)).one()
             self.assertEqual(row.work_title, "作品真实标题")
             self.assertEqual(session.get(CommentAnalysis, ai.analysis_id(row)).work_title, "作品真实标题")
+            self.assertEqual(session.get(CommentAnalysis, ai.analysis_id(row)).comment_create_time, 1)
         self.config["auto_analyze"] = False
         self.save()
         row_id, key = self.add("manual")
@@ -242,6 +258,63 @@ class CommentAITests(unittest.TestCase):
             self.assertEqual(row.work_title, "自有作品标题")
             self.assertEqual(row.prompt, ai.DEFAULT_PROMPT)
             self.assertEqual(row.prompt_version, 1)
+
+    def test_single_work_scan_recovers_title_for_existing_and_new_leads(self):
+        from app.config import Config
+        from app.engine.monitor import MonitorEngine
+
+        with db.get_session() as session:
+            watch = CommentWatch(platform="douyin", kind="video", aweme_id="w1", title="视频 w1")
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        _, old_key = self.add("old", watch_id=watch_id, title="")
+        with db.get_session() as session:
+            # Simulate an analysis already stored by the old implementation.
+            session.get(CommentAnalysis, old_key).work_title = "视频 w1"
+            session.commit()
+        self.analyze_all()
+
+        engine = MonitorEngine.__new__(MonitorEngine)
+        engine.cfg = Config()
+        engine.cfg.engine.douyin_read_mode = "browser"
+        # The browser only sees an already stored comment on this scan.
+        from types import SimpleNamespace
+
+        class WorkPage:
+            def on(self, event, callback):
+                self.on_response = callback
+
+            async def goto(self, url, **kwargs):
+                await self.on_response(SimpleNamespace(
+                    url="https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=w1",
+                    status=200, json=AsyncMock(return_value={"status_code": 0, "aweme_detail": {
+                        "aweme_id": "w1", "desc": "装修服务真实标题", "video": {"duration": 1000},
+                    }})))
+                await self.on_response(SimpleNamespace(
+                    url="https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=w1",
+                    json=AsyncMock(return_value={"comments": [{"cid": "old"}]})))
+
+            wait_for_timeout = AsyncMock()
+            evaluate = AsyncMock()
+            close = AsyncMock()
+
+        engine.browser = SimpleNamespace(new_page=AsyncMock(return_value=WorkPage()))
+        self.assertEqual(asyncio.run(engine._cw_video(watch_id, None, "w1", "视频 w1", True)), (0, None))
+
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            body = send.call_args.args[3]
+            self.assertIn("作品：装修服务真实标题", body)
+            self.assertIn("作品链接：https://www.douyin.com/video/w1", body)
+
+        raw_comment = {"cid": "new", "text": "怎么预约", "create_time": 1}
+        with patch("app.engine.monitor.fetch_comments", AsyncMock(return_value=([raw_comment], ""))):
+            self.assertEqual(asyncio.run(engine._cw_video(watch_id, None, "w1", "装修服务真实标题", True)), (1, None))
+        with db.get_session() as session:
+            row = session.exec(select(CommentRecord).where(CommentRecord.comment_id == "new")).one()
+            self.assertEqual(row.work_title, "装修服务真实标题")
+            self.assertEqual(session.get(CommentAnalysis, ai.analysis_id(row)).work_title, row.work_title)
 
     def test_stale_requests_are_held_not_automatically_repeated(self):
         _, key = self.add()

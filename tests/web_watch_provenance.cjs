@@ -66,7 +66,9 @@ async function run() {
       captured_at:'2026-09-08T08:00:00.123+00:00',watch_source:{id:99,module,platform:'douyin',deleted:true,name:'<img onerror="attack()">'}};
     const html=f.run(`watchRecordSourceMarkup('${kind}',row)`);
     assert.ok(!html.includes('<img onerror=')&&!html.includes('<script>'));
-    assert.ok(html.includes('原任务已删除')&&html.includes(`showWatchRecords('${kind}',99)`));
+    assert.ok(html.includes(`showWatchRecords('${kind}',99)`) && html.includes('作品 ID：'));
+    assert.equal(html.includes('来源任务'), kind === 'danmaku');
+    assert.equal(html.includes('原任务已删除'), kind === 'danmaku');
     const time=f.run(`watchRecordTimeMarkup('${kind}',row)`);
     assert.ok(time.includes('2026-09-08T08:00:00.123Z')&&time.includes('published:123'));
     f.context.row.captured_at=null;

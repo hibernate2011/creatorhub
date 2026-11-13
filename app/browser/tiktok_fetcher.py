@@ -12,6 +12,7 @@ from ..platforms.tiktok.extract import (
     flatten_tiktok_comments,
     parse_tiktok_app_context,
     parse_tiktok_user,
+    tiktok_display_text,
 )
 from ..platforms.tiktok.urls import (
     COMMENT_LIST_API,
@@ -493,12 +494,33 @@ async def _expand_reply_threads(page, max_clicks: int = 12) -> None:
                 return
 
 
+async def _tiktok_work_title(page, aweme_id: str) -> str:
+    for payload in await _page_hydration_payloads(page):
+        for raw in _search_items_from_payload(payload):
+            if _tiktok_item_id(raw) == aweme_id:
+                item = _tiktok_item(raw)
+                if title := tiktok_display_text(item.get("desc") or item.get("title")):
+                    return title
+    return ""
+
+
+async def fetch_tiktok_work_title(mgr, identity, aweme_id: str, target_url: str) -> str:
+    """Read the title when the native comment endpoint has no work metadata."""
+    page = await mgr.new_page(identity, block_media=True)
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        return await _tiktok_work_title(page, aweme_id)
+    finally:
+        await page.close()
+
+
 async def fetch_tiktok_comments(
         mgr: BrowserManager, identity: Identity, aweme_id: str,
         known_ids: set[str] | None = None, *, max_comments: int = 20,
         max_scrolls: int = 12, include_replies: bool = False,
         block_media: bool = True, author_unique_id: str = "",
-        target_url: str = "") -> Tuple[List[dict], str]:
+        target_url: str = "", work_metadata: dict[str, str] | None = None
+        ) -> Tuple[List[dict], str]:
     known_ids = known_ids or set()
     collected: Dict[str, dict] = {}
     page = await mgr.new_page(identity, block_media)
@@ -539,6 +561,8 @@ async def fetch_tiktok_comments(
         failure = await _page_failure(page)
         if failure:
             return [], failure
+        if work_metadata is not None:
+            work_metadata["title"] = await _tiktok_work_title(page, aweme_id)
         for _ in range(max(1, min(30, int(max_scrolls or 1)))):
             if include_replies:
                 await _expand_reply_threads(page)

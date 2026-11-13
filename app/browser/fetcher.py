@@ -15,7 +15,9 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 from .identity import Identity
 from .manager import BrowserManager
 from .douyin_auth import douyin_login_prompt_visible
+from .douyin_detail import _DETAIL_SNAPSHOT_JS
 from ..platforms.douyin.auth import parse_self_profile_response
+from ..platforms.douyin.detail import parse_detail_response
 from ..platforms.douyin.extract import danmaku_key
 
 POST_API = "aweme/v1/web/aweme/post"
@@ -588,7 +590,7 @@ _SCROLL_COMMENTS = """
 async def fetch_comments(mgr: BrowserManager, identity: Identity, aweme_id: str,
                          known_cids: Set[str], max_scrolls: int = 6,
                          settle_ms: int = 1600, block_media: bool = True,
-                         context=None,
+                         context=None, *, work_metadata: dict[str, str] | None = None,
                          ) -> Tuple[List[dict], str]:
     """打开作品详情页,滚动评论容器翻页,拦截评论列表接口收集评论原始 JSON。
     返回 (新评论原始列表, error)。注意:抖音评论默认按热度排序,非严格时间序,
@@ -600,6 +602,13 @@ async def fetch_comments(mgr: BrowserManager, identity: Identity, aweme_id: str,
             else await mgr.new_page(identity, block_media))
 
     async def on_response(resp):
+        if work_metadata is not None and "/aweme/v1/web/aweme/detail/" in resp.url:
+            try:
+                item, _ = parse_detail_response(await resp.json(), aweme_id, resp.status)
+                if item and item.get("desc"):
+                    work_metadata["title"] = item["desc"]
+            except Exception:
+                pass
         if COMMENT_API in resp.url:
             try:
                 data = await resp.json()
@@ -629,6 +638,14 @@ async def fetch_comments(mgr: BrowserManager, identity: Identity, aweme_id: str,
                     break
             else:
                 stagnant = 0
+        if work_metadata is not None and not work_metadata.get("title"):
+            try:
+                snapshot = await page.evaluate(_DETAIL_SNAPSHOT_JS, aweme_id)
+                item = (snapshot or {}).get("item") or {}
+                if item.get("desc"):
+                    work_metadata["title"] = item["desc"]
+            except Exception:
+                pass
     except Exception as e:
         error = f"打开作品页失败: {e!r}"
     finally:

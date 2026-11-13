@@ -3420,20 +3420,19 @@
         <span class="filter-count" id="comment-filter-count" role="status" aria-live="polite"></span>
         <div class="toolbar-actions"><span class="toolbar-actions-label">操作</span>
           <div class="export-actions" role="group" aria-label="评论数据 Excel 导出"><span class="export-caption" title="导出当前模块数据"><svg aria-hidden="true"><use href="#i-download"/></svg>Excel</span><button type="button" class="export-btn filtered" onclick="exportModuleReport('comments', false, this)" title="导出当前条件下的全部匹配记录" aria-label="导出评论数据当前结果"><svg aria-hidden="true"><use href="#i-download"/></svg>当前结果</button><button type="button" class="export-btn full" onclick="exportModuleReport('comments', true, this)" title="导出当前平台全部记录" aria-label="导出评论数据全部数据"><svg aria-hidden="true"><use href="#i-download"/></svg>全部数据</button></div>
-          <button class="ghost sm" id="comment-selall-btn" onclick="commentSelAllToggle()">全选</button>
-          <span class="mut" id="comment-selcount" style="display:none">已选 0</span>
-          <button class="sm danger" id="comment-batchbtn" style="display:none" onclick="commentBatchDelete()"><svg><use href="#i-trash"/></svg>批量删除</button>
           <button class="ghost sm danger" onclick="clearComments()"><svg><use href="#i-trash"/></svg>清空评论</button>
         </div>
     </div>
-    <div role="group" aria-label="AI 潜客分析操作" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0">
+    <div role="group" aria-label="评论批量操作与 AI 配置" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0">
       <button type="button" class="sm" id="comment-analyze" disabled onclick="commentAIAction('analyze')"><svg aria-hidden="true"><use href="#i-bolt"/></svg>分析所选</button>
       <button type="button" class="ghost sm wb-secondary-action" id="comment-forward" disabled onclick="commentAIAction('forward')"><svg aria-hidden="true"><use href="#i-send"/></svg>按阈值转发所选</button>
       <button type="button" class="ghost sm wb-secondary-action" onclick="openCommentAISettings()"><svg aria-hidden="true"><use href="#i-settings"/></svg>AI 配置</button>
+      <span id="comment-selcount" class="comment-selection-count" role="status" aria-live="polite"></span>
+      <button type="button" class="ghost sm danger" id="comment-batchbtn" style="display:none" onclick="commentBatchDelete()"><svg aria-hidden="true"><use href="#i-trash"/></svg>批量删除</button>
     </div>
     <div class="table-wrap" id="comment-table-wrap"><table class="watch-record-table comment-record-table" aria-label="已抓取评论、来源任务与抓取时间"><thead><tr>
-      <th style="width:30px"><input type="checkbox" id="comment-selall" onchange="commentToggleAll(this.checked)" aria-label="全选"></th>
-      <th>评论 / 来源任务</th><th>用户</th><th>赞</th><th>抓取 / 评论时间</th><th>操作</th>
+      <th scope="col" class="watch-record-check"><label class="watch-record-selection" title="全选本页评论"><input type="checkbox" id="comment-selall" onchange="commentToggleAll(this.checked)" aria-label="全选本页评论" disabled><span>全选本页</span></label></th>
+      <th scope="col">评论 / 来源任务</th><th scope="col" class="watch-record-user">用户</th><th scope="col" class="watch-record-likes">点赞</th><th scope="col">记录时间</th><th scope="col">操作</th>
     </tr></thead><tbody id="comment-table"></tbody></table></div>
     <div id="comment-pager" class="danmaku-pager" hidden>
       <div class="danmaku-pager-left">

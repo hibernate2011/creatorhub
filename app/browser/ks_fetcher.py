@@ -443,7 +443,8 @@ async def fetch_ks_videos(mgr: BrowserManager, identity: Identity, user_id: str,
 
 async def fetch_ks_comments(mgr: BrowserManager, identity: Identity, photo_id: str,
                             known_cids: Set[str], max_scrolls: int = 6,
-                            settle_ms: int = 1600, block_media: bool = True
+                            settle_ms: int = 1600, block_media: bool = True, *,
+                            work_metadata: dict[str, str] | None = None
                             ) -> Tuple[List[dict], str]:
     """打开作品详情页,滚动评论区翻页,拦截评论 GraphQL 收集评论原始 JSON。
     返回 (新评论原始列表, error)。"""
@@ -464,7 +465,8 @@ async def fetch_ks_comments(mgr: BrowserManager, identity: Identity, photo_id: s
             if len(api_seen) < 60:
                 p = url.split("?")[0].split("kuaishou.com")[-1]
                 api_seen.append(f"{resp.status} {p}")
-        if not is_graphql and not is_rest_comment:
+        is_photo = work_metadata is not None and "/rest/v/photo/" in url and not is_rest_comment
+        if not is_graphql and not is_rest_comment and not is_photo:
             return
         operation = ""
         if is_graphql:
@@ -477,6 +479,18 @@ async def fetch_ks_comments(mgr: BrowserManager, identity: Identity, photo_id: s
         try:
             data = await resp.json()
         except Exception:
+            return
+        if work_metadata is not None and isinstance(data, dict):
+            payload = data.get("data") or data
+            if isinstance(payload, dict):
+                detail = payload.get("visionVideoDetail") or payload
+                if isinstance(detail, dict):
+                    photo = detail.get("photo") or detail
+                    if _feed_id(photo) == photo_id:
+                        title = _rf(photo, "caption", "captionWithEmojiTrans")
+                        if title:
+                            work_metadata["title"] = title
+        if is_photo:
             return
         if is_graphql and len(gql_shape) < 40:
             d = data.get("data") if isinstance(data, dict) else None

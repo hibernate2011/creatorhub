@@ -35,10 +35,12 @@ from ..browser.tiktok_actions import (
     post_tiktok_comment,
     send_tiktok_dm,
 )
+from ..browser.douyin_detail import fetch_douyin_video_detail
 from ..browser.tiktok_fetcher import (
     fetch_tiktok_comments,
     fetch_tiktok_profile_works,
     fetch_tiktok_self_profile,
+    fetch_tiktok_work_title,
 )
 from . import compose
 from ..config import Config
@@ -3207,12 +3209,28 @@ class MonitorEngine:
                 s.add(w); s.commit()
         return {"ok": not error, "new_comments": total_new, "error": error}
 
+    def _comment_work_title(self, platform, aweme_id, work_desc=""):
+        from ..comment_ai import find_work_title
+        with get_session() as s:
+            return find_work_title(s, platform, aweme_id, work_desc)
+
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
                       platform="douyin") -> int:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
-        if not fresh:
+        from ..comment_ai import clean_work_title, enqueue
+
+        work_desc = clean_work_title(work_desc, aweme_id)
+        if not fresh and not work_desc:
             return 0
         with get_session() as s:
+            if work_desc:
+                watch = s.get(CommentWatch, watch_id)
+                if (watch and watch.kind == "video" and watch.aweme_id == aweme_id
+                        and watch.platform == platform and watch.title != work_desc):
+                    watch.title = work_desc
+            if not fresh:
+                s.commit()
+                return 0
             times = s.exec(select(CommentRecord.create_time)
                            .where(CommentRecord.watch_id == watch_id)
                            .where(CommentRecord.aweme_id == aweme_id)).all()
@@ -3223,12 +3241,11 @@ class MonitorEngine:
                                        aweme_id=aweme_id, **{**c, "work_title": work_desc or ""})
                 s.add(record)
                 ai_rows.append(record)
-            from ..comment_ai import enqueue
             enqueue(s, ai_rows, automatic=True)
             s.commit()
         newer = [c for c in fresh if c["create_time"] > prev_max]
         if not first_scan and newer:
-            await self._notify_comments(name, work_desc, newer)
+            await self._notify_comments(name, work_desc or name, newer)
         return len(fresh)
 
     def _comment_watch_settings(self, watch_id: int) -> dict:
@@ -3248,6 +3265,7 @@ class MonitorEngine:
                         api_client=None, work_desc=""):
         cfg = self.cfg.engine
         settings = self._comment_watch_settings(watch_id)
+        work_desc = self._comment_work_title("douyin", aweme_id, work_desc)
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id)
                                .where(CommentRecord.watch_id == watch_id)
@@ -3261,8 +3279,22 @@ class MonitorEngine:
                          if c and c["comment_id"] not in known]
                 # 非空响应即使全部是已知评论也代表 API 成功，不应重复打开浏览器。
                 if raw or not api_client.last_error:
+                    if raw and not work_desc:
+                        try:
+                            async with api_client.session_scope():
+                                detail = await api_client.fetch_video_detail(aweme_id)
+                            work_desc = (detail or {}).get("desc") or ""
+                            if (not work_desc and cfg.douyin_read_mode == "hybrid"
+                                    and classify_platform_error(api_client.last_error)[0] not in {
+                                        RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK
+                                    }):
+                                detail, _ = await fetch_douyin_video_detail(
+                                    self.browser, identity, aweme_id, timeout_ms=3000)
+                                work_desc = detail.get("desc") or ""
+                        except Exception as exc:
+                            log.debug("评论监控(抖音作品)读取标题失败 %s: %s", aweme_id, exc)
                     return (await self._ingest(
-                        watch_id, aweme_id, fresh, name, work_desc or name,
+                        watch_id, aweme_id, fresh, name, work_desc,
                         first_scan), None)
                 err = api_client.last_error or "empty_response"
                 if cfg.douyin_read_mode == "api":
@@ -3275,16 +3307,18 @@ class MonitorEngine:
                     raise
         elif cfg.douyin_read_mode == "api":
             raise RuntimeError("douyin_api_comments:no_cookie")
+        metadata = {}
         raw, browser_err = await fetch_comments(
             self.browser, identity, aweme_id, known,
             max_scrolls=settings["max_scrolls"],
-            block_media=cfg.block_media_resources)
+            block_media=cfg.block_media_resources,
+            work_metadata=None if work_desc else metadata)
         err = browser_err or err
         if err:
             log.info("评论监控(视频)%s: %s", aweme_id, err)
         fresh = [c for c in (parse_comment(rc) for rc in raw) if c]
         n = await self._ingest(watch_id, aweme_id, fresh, name,
-                               work_desc or name, first_scan)
+                               work_desc or metadata.get("title", ""), first_scan)
         return n, None
 
     async def _cw_user_public(self, watch_id, identity, sec_uid, name, first_scan,
@@ -3339,17 +3373,21 @@ class MonitorEngine:
     async def _cw_ks_video(self, watch_id, identity, photo_id, name, first_scan):
         cfg = self.cfg.engine
         settings = self._comment_watch_settings(watch_id)
+        work_desc = self._comment_work_title("kuaishou", photo_id)
+        metadata = {}
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id)
                                .where(CommentRecord.watch_id == watch_id)
                                .where(CommentRecord.aweme_id == photo_id)).all())
         raw, err = await fetch_ks_comments(self.browser, identity, photo_id, known,
                                            max_scrolls=settings["max_scrolls"],
-                                           block_media=cfg.block_media_resources)
+                                           block_media=cfg.block_media_resources,
+                                           work_metadata=None if work_desc else metadata)
         if err:
             log.info("评论监控(快手作品)%s: %s", photo_id, err)
         fresh = [c for c in (parse_ks_comment(rc) for rc in flatten_ks_comments(raw)) if c]
-        n = await self._ingest(watch_id, photo_id, fresh, name, name, first_scan,
+        n = await self._ingest(watch_id, photo_id, fresh, name,
+                               work_desc or metadata.get("title", ""), first_scan,
                                platform="kuaishou")
         return n, None
 
@@ -3392,6 +3430,8 @@ class MonitorEngine:
         if not author_unique_id:
             raise RuntimeError("TikTok 评论监控缺少作品作者 @username")
         settings = self._comment_watch_settings(watch_id)
+        work_desc = self._comment_work_title("tiktok", aweme_id, work_desc)
+        metadata = {}
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id).where(
                 CommentRecord.watch_id == watch_id,
@@ -3422,13 +3462,19 @@ class MonitorEngine:
                 self.browser, identity, aweme_id, known, max_comments=300,
                 max_scrolls=settings["max_scrolls"], include_replies=True,
                 block_media=self.cfg.engine.block_media_resources,
-                author_unique_id=author_unique_id, target_url=target_url)
+                author_unique_id=author_unique_id, target_url=target_url,
+                work_metadata=None if work_desc else metadata)
             if browser_error and not raw:
                 raise RuntimeError(browser_error)
+        elif raw and not work_desc:
+            try:
+                work_desc = await fetch_tiktok_work_title(self.browser, identity, aweme_id, target_url)
+            except Exception as exc:
+                log.debug("评论监控(TikTok 作品)读取标题失败 %s: %s", aweme_id, exc)
         fresh = [c for c in (parse_tiktok_comment(item) for item in raw)
                  if c and c["comment_id"] not in known]
         count = await self._ingest(
-            watch_id, aweme_id, fresh, name, work_desc or name, first_scan,
+            watch_id, aweme_id, fresh, name, work_desc or metadata.get("title", ""), first_scan,
             platform="tiktok")
         return count, None
 
@@ -3524,6 +3570,8 @@ class MonitorEngine:
     async def _cw_xhs_note(
             self, watch_id, identity, state, note_id, xsec_token, name,
             first_scan, proxy=""):
+        work_desc = self._comment_work_title("xhs", note_id)
+        metadata = {}
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id)
                                .where(CommentRecord.watch_id == watch_id)
@@ -3533,7 +3581,8 @@ class MonitorEngine:
                 self.browser, identity, note_id, known,
                 xsec_token=xsec_token, xsec_source="pc_feed",
                 max_scrolls=self._comment_watch_settings(watch_id)["max_scrolls"],
-                block_media=self.cfg.engine.block_media_resources)
+                block_media=self.cfg.engine.block_media_resources,
+                work_metadata=None if work_desc else metadata)
             if error:
                 log.info("评论监控(小红书)%s: %s", note_id, error)
                 self._raise_severe_xhs_read_error(error)
@@ -3547,7 +3596,14 @@ class MonitorEngine:
                 return 0, None
             fresh = await self._xhs_fetch_comments(
                 client, note_id, xsec_token, known)
-        n = await self._ingest(watch_id, note_id, fresh, name, name, first_scan,
+            if (fresh or known) and not work_desc:
+                try:
+                    card = await client.note_detail(note_id, xsec_token=xsec_token) or {}
+                    work_desc = card.get("title") or card.get("display_title") or card.get("desc") or ""
+                except Exception as exc:
+                    log.debug("评论监控(小红书笔记)读取标题失败 %s: %s", note_id, exc)
+        n = await self._ingest(watch_id, note_id, fresh, name,
+                               work_desc or metadata.get("title", ""), first_scan,
                                platform="xhs")
         return n, None
 

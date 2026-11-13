@@ -10,7 +10,7 @@ import hashlib
 import json
 import logging
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -250,10 +250,39 @@ def resolve_prompt(config, row, watch):
     return max(matches, key=lambda item: item[:2])[2]
 
 
+def clean_work_title(value: str, aweme_id: str) -> str:
+    title = value.strip() if isinstance(value, str) else ""
+    if title == aweme_id or any(title == f"{label} {aweme_id}" for label in ("视频", "作品", "笔记")):
+        return ""
+    if title.startswith("@") and title.partition(" ")[2] == f"视频 {aweme_id}":
+        return ""
+    return title
+
+
+def find_work_title(session, platform: str, aweme_id: str, saved_title: str = "") -> str:
+    title = clean_work_title(saved_title, aweme_id)
+    if title or not aweme_id:
+        return title
+    for model, column, work_id in (
+        (CommentWatch, CommentWatch.title, CommentWatch.aweme_id),
+        (ContentRecord, ContentRecord.desc, ContentRecord.aweme_id),
+        (AccountWork, AccountWork.desc, AccountWork.item_id),
+        (CommentRecord, CommentRecord.work_title, CommentRecord.aweme_id),
+    ):
+        candidates = session.exec(select(column).where(
+            model.platform == platform, work_id == aweme_id, column != ""
+        ).order_by(model.id.desc()))
+        for value in candidates:
+            if title := clean_work_title(value, aweme_id):
+                return title
+    return ""
+
+
 def enqueue(session, rows, *, automatic=False):
     """Call in the ingestion transaction; no network, no independent commit."""
     config = settings(session)
     counts = {"queued": 0, "skipped": 0}
+    work_titles = {}
     if not automatic and not config["api_key"]:
         raise HTTPException(422, "请先配置 OpenRouter API Key")
     for row in rows:
@@ -261,6 +290,8 @@ def enqueue(session, rows, *, automatic=False):
         policy = watch_policy(watch)
         key = analysis_id(row)
         existing = session.get(CommentAnalysis, key) if row.comment_id else None
+        if existing and not existing.comment_create_time and row.create_time:
+            existing.comment_create_time = row.create_time
         if existing and automatic and auto_enabled(config, policy, "auto_forward"):
             queue_deliveries(session, existing, watch_destinations(config, watch, policy),
                              watch_id=row.watch_id or 0, automatic=True)
@@ -270,20 +301,15 @@ def enqueue(session, rows, *, automatic=False):
         if automatic and (not config["api_key"] or not auto_enabled(config, policy, "auto_analyze")):
             continue
         prompt = resolve_prompt(config, row, watch)
-        title = row.work_title
+        title = clean_work_title(row.work_title, row.aweme_id)
         if not title:
-            content = session.exec(select(ContentRecord).where(
-                ContentRecord.platform == row.platform, ContentRecord.aweme_id == row.aweme_id)
-                .order_by(ContentRecord.id.desc())).first()
-            title = content.desc if content else ""
-        if not title:
-            work = session.exec(select(AccountWork).where(
-                AccountWork.platform == row.platform, AccountWork.item_id == row.aweme_id)).first()
-            title = work.desc if work else ""
-        if not title and watch and watch.kind == "video":
-            title = watch.title
+            work_key = (row.platform, row.aweme_id)
+            if work_key not in work_titles:
+                work_titles[work_key] = find_work_title(session, *work_key)
+            title = work_titles[work_key]
         item = CommentAnalysis(id=key, platform=row.platform, aweme_id=row.aweme_id,
             comment_id=row.comment_id, watch_id=row.watch_id or 0, text=row.text,
+            comment_create_time=row.create_time or 0,
             user_nickname=row.user_nickname, user_sec_uid=row.user_sec_uid,
             user_profile_url=row.user_profile_url,
             work_title=title, prompt_id=prompt["id"], prompt_name=prompt["name"],
@@ -393,13 +419,20 @@ async def process_batch():
             .order_by(CommentAnalysis.created_at, CommentAnalysis.id).limit(config["batch_size"])).all()
         rows = []
         budget = 0
+        work_title = None
         for row in candidates:
-            size = len(row.prompt) + len(row.text[:16000]) + len(row.work_title[:2000]) + 500
+            title = clean_work_title(row.work_title, row.aweme_id)
+            if not title:
+                if work_title is None:
+                    work_title = find_work_title(session, row.platform, row.aweme_id)
+                title = work_title
+            size = len(row.prompt) + len(row.text[:16000]) + len(title[:2000]) + 500
             if rows and budget + size > 100000:
                 break
             claimed = session.execute(update(CommentAnalysis).where(CommentAnalysis.id == row.id,
                 CommentAnalysis.status == "queued").values(status="processing", updated_at=datetime.utcnow()))
             if claimed.rowcount:
+                row.work_title = title
                 rows.append(row)
                 budget += size
         payload = request_payload(rows) if rows else None
@@ -447,9 +480,18 @@ def lead_text(row):
                  "kuaishou": "https://www.kuaishou.com/short-video/"}
     profile_urls = {"douyin": "https://www.douyin.com/user/", "xhs": "https://www.xiaohongshu.com/user/profile/",
                     "kuaishou": "https://www.kuaishou.com/profile/"}
+    comment_time = "未知"
+    try:
+        if row.comment_create_time > 0:
+            comment_time = datetime.fromtimestamp(
+                row.comment_create_time, timezone(timedelta(hours=8))
+            ).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        pass
     lines = [f"潜客置信度：{row.confidence:.1%}", f"平台：{row.platform}",
-             f"作品：{row.work_title[:500] or row.aweme_id}", f"用户：{row.user_nickname[:100]}",
-             f"评论：{row.text[:1800]}"]
+             f"作品：{clean_work_title(row.work_title, row.aweme_id)[:500] or '未获取到标题'}",
+             f"用户：{row.user_nickname[:100]}",
+             f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"]
     if row.platform in work_urls and row.aweme_id:
         lines.append(f"作品链接：{work_urls[row.platform]}{quote(row.aweme_id, safe='')}")
     profile = row.user_profile_url
@@ -483,6 +525,17 @@ async def process_delivery():
                 CommentLeadDelivery.status == "pending").values(status="skipped", error="推送已关闭、渠道已变更或未达到当前阈值"))
             session.commit()
             return True
+        analysis.work_title = find_work_title(
+            session, analysis.platform, analysis.aweme_id, analysis.work_title)
+        if not analysis.comment_create_time:
+            timestamp = session.exec(select(CommentRecord.create_time).where(
+                CommentRecord.platform == analysis.platform,
+                CommentRecord.aweme_id == analysis.aweme_id,
+                CommentRecord.comment_id == analysis.comment_id,
+                CommentRecord.create_time > 0,
+            ).order_by(CommentRecord.id)).first()
+            if timestamp:
+                analysis.comment_create_time = timestamp
         key, text = row.id, lead_text(analysis)
         claimed = session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == key,
             CommentLeadDelivery.status == "pending", ~cooling).values(status="sending", attempts=CommentLeadDelivery.attempts + 1,

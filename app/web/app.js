@@ -2351,25 +2351,31 @@ function backToWatchTasks(kind) {
 function watchRecordSourceMarkup(kind, row) {
   const view = watchRecordConfig(kind), source = watchRecordSource(kind, row), id = Number(source.id);
   const label = esc(source.name), linked = Number.isSafeInteger(id) && id >= 0;
+  const name = linked ? `<button type="button" class="content-source-link" onclick="showWatchRecords('${kind}',${id})" title="查看此来源的记录">${label}</button>` : `<span>${label}</span>`;
+  const work = row.aweme_id ? `<span class="watch-record-work">作品 ID：${esc(row.aweme_id)}</span>` : "";
+  if (kind === "comment") return `<div class="content-origin">${name}${work}</div>`;
   const detail = source.unassigned ? "来源监控信息未记录" : `${view.label}任务 #${id}${source.deleted ? " · 原任务已删除，历史记录保留" : source.kind === "user" ? " · 账号监控" : " · 作品监控"}`;
   return `<div class="content-origin"><span class="content-origin-label">来源任务</span>
-    ${linked ? `<button type="button" class="content-source-link" onclick="showWatchRecords('${kind}',${id})" title="查看此来源的记录">${label}</button>` : `<span>${label}</span>`}
-    <span class="content-origin-meta">${esc(detail)}</span>
-    ${row.aweme_id ? `<span class="watch-record-work">作品 ID：${esc(row.aweme_id)}</span>` : ""}</div>`;
+    ${name}<span class="content-origin-meta">${esc(detail)}</span>${work}</div>`;
 }
 function watchRecordTimeMarkup(kind, row) {
   const captured = row.captured_at !== undefined ? row.captured_at : row.created_at;
-  return `<span class="content-origin-label">抓取入库</span>${contentCapturedTime(captured, kind === "danmaku")}
-    <div class="content-published-time">${kind === "comment" ? "评论发布" : "弹幕发送"} · ${fmtTime(row.create_time)}</div>`;
+  const capture = `<span class="content-origin-label">抓取入库</span>${contentCapturedTime(captured, kind === "danmaku")}`;
+  if (kind === "comment") {
+    return `<div class="comment-record-time-group">${capture}</div>
+      <div class="comment-record-time-group"><span class="content-origin-label">评论发布</span><span class="content-published-time">${fmtTime(row.create_time)}</span></div>`;
+  }
+  return `${capture}<div class="content-published-time">弹幕发送 · ${fmtTime(row.create_time)}</div>`;
 }
 function prepareWatchRecordLoad(kind, resetPage) {
   const view = watchRecordConfig(kind), scope = PLATFORM + ":" + view.src;
   const clear = resetPage || view.state.scope !== scope; view.state.scope = scope;
   updateWatchRecordScope(kind);
   if (clear) {
-    if (kind === "comment") { COMMENT_PAGE = 1; selComment.clear(); updateCommentSelBar(); }
+    if (kind === "comment") { COMMENT_PAGE = 1; selComment.clear(); }
     else DANMAKU_PAGE = 1;
     $(kind + "-table").innerHTML = empty(6, "正在读取当前来源的记录…", "i-clock");
+    if (kind === "comment") updateCommentSelBar();
     view.pager({ total: 0, page: 1, page_size: view.pageSize });
     if ($(kind + "-filter-count")) $(kind + "-filter-count").textContent = "正在读取…";
   }
@@ -6533,21 +6539,15 @@ async function contentBatchDelete() {
 const COMMENT_CBS = '#comment-table input[type="checkbox"]';
 function commentToggleOne(id, on) { on ? selComment.add(id) : selComment.delete(id); updateCommentSelBar(); }
 function commentToggleAll(on) { document.querySelectorAll(COMMENT_CBS).forEach(cb => { const id = +cb.dataset.id; if (!id) return; cb.checked = on; on ? selComment.add(id) : selComment.delete(id); }); updateCommentSelBar(); }
-function commentSelAllToggle() {
-  const ids = [...document.querySelectorAll(COMMENT_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
-  const allSel = ids.length > 0 && ids.every(id => selComment.has(id));
-  commentToggleAll(!allSel);
-}
 function commentSelClear() { selComment.clear(); const sa = $("comment-selall"); if (sa) sa.checked = false; refreshComments(); }
 function updateCommentSelBar() {
   const n = selComment.size; const c = $("comment-selcount"), b = $("comment-batchbtn");
   for (const id of ["comment-analyze", "comment-forward"]) { if ($(id)) $(id).disabled = !n; }
-  c.textContent = "已选 " + n; c.style.display = n ? "inline" : "none"; b.style.display = n ? "inline-flex" : "none";
+  c.textContent = n ? `已选 ${n} 条` : ""; b.style.display = n ? "inline-flex" : "none";
   const ids = [...document.querySelectorAll(COMMENT_CBS)].map(cb => +cb.dataset.id).filter(Boolean);
   const allSel = ids.length > 0 && ids.every(id => selComment.has(id));
   const selectedOnPage = ids.filter(id => selComment.has(id)).length;
-  const btn = $("comment-selall-btn"); if (btn) btn.textContent = allSel ? "取消全选" : "全选";
-  const sa = $("comment-selall"); if (sa) { sa.checked = allSel; sa.indeterminate = selectedOnPage > 0 && !allSel; }
+  const sa = $("comment-selall"); if (sa) { sa.disabled = !ids.length; sa.checked = allSel; sa.indeterminate = selectedOnPage > 0 && !allSel; }
 }
 async function commentBatchDelete() {
   if (!selComment.size) return;
@@ -7463,9 +7463,9 @@ async function refreshComments(resetPage = false) {
   $("comment-table").innerHTML = rows.map(r => {
     return `<tr>
     <td class="watch-record-check"><label class="watch-record-selection" title="选择这条评论"><input type="checkbox" data-id="${r.id}" aria-label="选择这条评论" onchange="commentToggleOne(${r.id}, this.checked)" ${selComment.has(r.id) ? "checked" : ""}></label></td>
-    <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="mut">回复 · </span>' : ""}${esc(r.text || "")}</div>${watchRecordSourceMarkup("comment", r)}${typeof commentAIMarkup === 'function' ? commentAIMarkup(r) : ''}</td>
-    <td class="mut comment-user watch-record-user" data-label="用户"><div>${esc(r.user_nickname || "")}${r.ip_label ? ` · ${esc(r.ip_label)}` : ""}</div>${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
-    <td class="mut num watch-record-likes" data-label="赞">${fmtNum(r.like_count)}</td>
+    <td class="watch-record-main"><div class="watch-record-text">${r.is_reply ? '<span class="comment-record-reply">回复</span> ' : ""}${esc(r.text || "（空评论）")}</div>${watchRecordSourceMarkup("comment", r)}${typeof commentAIMarkup === 'function' ? commentAIMarkup(r) : ''}</td>
+    <td class="watch-record-user"><div class="comment-record-nickname">${esc(r.user_nickname || "匿名用户")}</div>${r.ip_label ? `<div class="comment-record-region">${esc(r.ip_label)}</div>` : ""}${r.user_sec_uid ? `<div class="comment-user-sec" title="${esc(r.user_sec_uid)}">sec_uid: ${esc(r.user_sec_uid)}</div>` : ""}</td>
+    <td class="watch-record-likes" data-label="点赞">${fmtNum(r.like_count)}</td>
     <td class="watch-record-time">${watchRecordTimeMarkup("comment", r)}</td>
     <td class="acttd watch-record-actions"><button class="ghost sm danger" onclick="delComment(${r.id})">${ic("i-trash")}删除</button></td>
   </tr>`;

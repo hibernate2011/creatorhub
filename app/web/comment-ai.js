@@ -6,9 +6,13 @@ let COMMENT_AI_FIELD = 0;
 
 function commentAIMarkup(row) {
   const ai = row.ai || {status: 'unanalyzed'};
-  const score = ai.confidence == null ? '' : ` · 潜客置信度 ${(ai.confidence * 100).toFixed(1)}%`;
+  const score = ai.confidence == null ? '' : `<strong>潜客置信度 ${(ai.confidence * 100).toFixed(1)}%</strong>`;
   const deliveries = (ai.deliveries || []).map(d => `<span title="${esc(d.error || '')}">${esc(d.name || d.destination_id)}：${d.status === 'failed' ? '转发失败' : esc(COMMENT_AI_LABELS[d.status] || d.status)}${d.status === 'failed' ? ` <button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('forward',true,${row.id})">${ic("i-refresh")}重试转发</button>` : ''}</span>`).join(' · ');
-  return `<div class="mut" title="${esc(ai.error || '')}">${esc(COMMENT_AI_LABELS[ai.status] || ai.status)}${score}${ai.prompt_id ? ` · ${esc(ai.prompt_name || ai.prompt_id)} v${ai.prompt_version}` : ''}${ai.status === 'failed' ? ` <button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',true,${row.id})">${ic("i-refresh")}重试分析</button><div>${esc(ai.error || '')}</div>` : ''}${deliveries ? `<div>${deliveries}</div>` : ''}</div>`;
+  const retry = ai.status === 'failed' ? `<button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',true,${row.id})">${ic("i-refresh")}重试分析</button>` : '';
+  return `<div class="comment-record-ai" title="${esc(ai.error || '')}"><div class="comment-record-ai-summary">
+    <span class="comment-record-ai-status" data-status="${esc(ai.status)}">${esc(COMMENT_AI_LABELS[ai.status] || ai.status)}</span>${score}
+    ${ai.prompt_id ? `<span>${esc(ai.prompt_name || ai.prompt_id)} v${ai.prompt_version}</span>` : ''}${retry}</div>
+    ${retry && ai.error ? `<div>${esc(ai.error)}</div>` : ''}${deliveries ? `<div>${deliveries}</div>` : ''}</div>`;
 }
 
 async function commentAIAction(action, retry = false, id = null) {

@@ -412,6 +412,7 @@ class CommentAnalysis(SQLModel, table=True):
     comment_id: str = Field(index=True)
     watch_id: int = 0
     text: str = ""
+    comment_create_time: int = 0
     user_nickname: str = ""
     user_sec_uid: str = ""
     user_profile_url: str = ""

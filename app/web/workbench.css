@@ -1185,9 +1185,6 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
 .ncard .ncard-sel:checked { background-color:var(--acc-solid); }
 .watch-record-table { table-layout:fixed; }
 .watch-record-table th,.watch-record-table td { white-space:normal; overflow-wrap:anywhere; }
-.comment-record-table th:first-child { width:44px; }
-.comment-record-table th:nth-child(2) { width:42%; }
-.comment-record-table th:nth-child(4) { width:84px; }
 .danmaku-record-table th:first-child { width:38%; }
 .watch-record-table th:nth-last-child(2) { width:192px; }
 .watch-record-table th:last-child { width:118px; }
@@ -1197,6 +1194,44 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
 .watch-record-time .content-captured-time { margin:4px 0 8px; }
 .watch-record-time .content-published-time { white-space:normal; }
 .watch-record-selection { display:inline-grid; place-items:center; cursor:pointer; }
+
+.comment-selection-count { align-self:center; color:var(--mut); font-size:13px; font-variant-numeric:tabular-nums; }
+.comment-selection-count:empty { display:none; }
+.comment-record-table th { letter-spacing:0; }
+.comment-record-table th.watch-record-check { width:52px; }
+.comment-record-table th.watch-record-user { width:23%; }
+.comment-record-table th.watch-record-likes { width:60px; }
+.comment-record-table th:nth-last-child(2) { width:176px; }
+.comment-record-table th:last-child { width:98px; }
+.watch-record-table.comment-record-table .watch-record-check { padding:0; text-align:center; }
+.comment-record-table .watch-record-selection { width:44px; height:44px; vertical-align:middle; }
+.comment-record-table .watch-record-selection span { display:none; }
+.comment-record-table .watch-record-selection:has(:disabled) { cursor:default; }
+.comment-record-table .watch-record-selection input:not(:checked):not(:indeterminate) { border-color:var(--control-line); }
+.comment-record-table tbody td { vertical-align:top; }
+.comment-record-table tbody td.watch-record-check { padding-top:4px; }
+.comment-record-table .watch-record-text { margin:0; color:var(--fg-strong); font-size:15px; font-weight:550; white-space:pre-wrap; }
+.comment-record-reply { display:inline-block; padding:0 6px; border-radius:5px; background:var(--surface-2); color:var(--mut); font-size:12px; font-weight:600; }
+.comment-record-table .content-origin { justify-items:start; gap:2px; margin:8px 0 0; }
+.comment-record-table .content-source-link { min-height:28px; font-weight:600; }
+.comment-record-table .watch-record-work { margin:0; font-variant-numeric:tabular-nums; }
+.comment-record-nickname { color:var(--fg-strong); font-size:14px; font-weight:600; line-height:1.5; }
+.comment-record-region { margin-top:4px; color:var(--mut); font-size:12px; }
+.comment-record-table .comment-user-sec { max-width:none; margin-top:5px; font-size:11px; }
+.comment-record-table .watch-record-likes { text-align:center; }
+.comment-record-table td.watch-record-likes { color:var(--fg); font-weight:600; font-variant-numeric:tabular-nums; }
+.comment-record-time-group { display:grid; gap:2px; }
+.comment-record-time-group + .comment-record-time-group { margin-top:8px; }
+.comment-record-time-group .content-captured-time { margin:0; }
+.comment-record-time-group :is(.content-captured-time,.content-published-time) { color:var(--fg); font-size:13px; font-variant-numeric:tabular-nums; }
+.comment-record-table .watch-record-actions button { margin:0; }
+.comment-record-ai { display:grid; gap:4px; margin-top:8px; color:var(--mut); font-size:12px; }
+.comment-record-ai-summary { display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; }
+.comment-record-ai-summary strong { color:var(--fg); font-weight:600; }
+.comment-record-ai-status { padding:1px 7px; border-radius:6px; background:var(--surface-2); }
+.comment-record-ai-status[data-status="done"] { color:var(--success); background:var(--success-soft); }
+.comment-record-ai-status[data-status="failed"] { color:var(--danger); background:var(--danger-soft); }
+
 @media(min-width:1100px) {
   .content-record-table .content-col-type { width:84px; }
   .content-record-table .content-col-time { width:176px; }
@@ -1211,7 +1246,6 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
   .watch-record-table tbody td { display:block; padding:0; min-width:0; border:0; text-align:left; }
   .watch-record-table .watch-record-main,.watch-record-table .watch-record-time,.watch-record-table .watch-record-actions,.watch-record-table td[colspan] { grid-column:1/-1; }
   .watch-record-table .watch-record-main { grid-row:1; }
-  .comment-record-table .watch-record-main { padding-right:32px; }
   .watch-record-table .watch-record-check { position:absolute; top:4px; right:4px; }
   .watch-record-selection { width:44px; height:44px; }
   .watch-record-selection input { width:20px; height:20px; margin:0; }
@@ -1220,6 +1254,20 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
   .watch-record-table .content-source-link,.watch-record-actions button { min-height:44px; }
   .watch-record-table .content-origin { margin-bottom:0; }
   .watch-record-point code { white-space:nowrap; }
+
+  .comment-record-table thead { display:block; background:var(--surface-2); }
+  .comment-record-table thead tr,.comment-record-table th.watch-record-check { display:block; }
+  .comment-record-table thead th:not(.watch-record-check) { display:none; }
+  .comment-record-table th.watch-record-check { position:static; width:auto; background:transparent; }
+  .comment-record-table th .watch-record-selection { display:flex; gap:8px; width:max-content; min-height:44px; padding:0 12px; }
+  .comment-record-table th .watch-record-selection span { display:inline; font-size:13px; }
+  .comment-record-table tbody tr { grid-template-columns:minmax(0,1fr) auto; gap:12px; }
+  .comment-record-table tbody td.watch-record-check { padding:0; }
+  .comment-record-table .watch-record-text { padding-right:36px; }
+  .comment-record-table td.watch-record-likes { text-align:right; min-width:40px; }
+  .comment-record-table .watch-record-time { grid-column:1; align-self:center; padding:0; border:0; }
+  .comment-record-table .watch-record-actions { grid-column:2; align-self:center; justify-self:end; }
+  .comment-record-table .watch-record-user,.comment-record-table td.watch-record-likes { padding-bottom:10px; border-bottom:1px solid var(--line-soft); }
 }
 @media(max-width:760px) {
   #content-table-wrap .content-record-table,#content-table-wrap tbody { display:block; min-width:0; width:100%; }

@@ -31,10 +31,32 @@ def test_workbench_watch_record_scope_and_layout(ui, kind, width, height, theme)
     area=page.locator(f"#{kind}-table")
     area.get_by_text("任务 A 本次抓取的内容",exact=True).wait_for()
     assert "任务 B 独立" not in area.inner_text()
-    assert "抓取入库" in area.inner_text() and "任务 #21" in area.inner_text()
-    assert ("评论发布" if kind == "comment" else "弹幕发送") in area.inner_text()
+    records_text = area.inner_text()
+    assert "抓取入库" in records_text
+    assert ("评论发布" if kind == "comment" else "弹幕发送") in records_text
     if kind == "danmaku":
-        assert "创作中心" in area.inner_text() and "0:12.340" in area.inner_text()
+        assert "任务 #21" in records_text and "创作中心" in records_text and "0:12.340" in records_text
+    else:
+        assert "来源任务" not in records_text and "评论任务 #21" not in records_text
+        assert "作品 ID：fixture-shared-work" in records_text
+        assert area.get_by_role("button", name="任务 A · 日常作品反馈", exact=True).count() == 2
+        select_all = page.get_by_role("checkbox", name="全选本页评论", exact=True)
+        row_checks = area.get_by_role("checkbox", name="选择这条评论", exact=True)
+        select_all.scroll_into_view_if_needed()
+        assert select_all.evaluate("""input => {
+          const box = input.getBoundingClientRect();
+          const cell = input.closest('th').getBoundingClientRect();
+          return box.left >= cell.left && box.right <= cell.right &&
+            [box.left + 2, box.right - 2].every(x => document.elementFromPoint(x, (box.top + box.bottom) / 2) === input);
+        }""")
+        row_checks.first.check()
+        assert select_all.evaluate("input => input.indeterminate")
+        select_all.check()
+        assert all(check.is_checked() for check in row_checks.all())
+        assert page.locator("#comment-selcount").inner_text() == "已选 2 条"
+        select_all.uncheck()
+        assert all(not check.is_checked() for check in row_checks.all())
+        assert page.locator("#comment-table-wrap").evaluate("el => el.scrollWidth <= el.clientWidth + 1")
     query=parse_qs(page.locator("html").get_attribute("data-fixture-watch-query").lstrip("?"))
     assert query["watch_id"] == ["21"] and query["sort"] == ["captured_desc"]
     if width <= 1100:
@@ -104,7 +126,8 @@ def test_workbench_watch_record_dates_errors_and_task_deletion(ui, kind):
     row.wait_for(state="detached")
     page.get_by_role("tab",name="评论记录" if kind=="comment" else "弹幕记录",exact=True).click()
     area.get_by_text("任务 A 本次抓取的内容",exact=True).wait_for()
-    assert "原任务已删除" in area.inner_text()
+    deleted_label = "已删除评论任务 #21" if kind == "comment" else "原任务已删除"
+    assert deleted_label in area.inner_text()
     delete_flag = "with_comments=false" if kind == "comment" else "with_records=false"
     assert delete_flag in page.locator("html").get_attribute("data-fixture-watch-delete")
     assert errors==[]

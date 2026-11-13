@@ -749,7 +749,8 @@ async def fetch_xhs_note_detail(mgr: BrowserManager, identity: Identity, note_id
 async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: str,
                              known_cids: Set[str], xsec_token: str = "",
                              xsec_source: str = "pc_feed", max_scrolls: int = 6,
-                             settle_ms: int = 1600, block_media: bool = True
+                             settle_ms: int = 1600, block_media: bool = True, *,
+                             work_metadata: dict[str, str] | None = None
                              ) -> Tuple[List[dict], str]:
     """打开笔记页,下滑评论区,拦截 comment/page 收集评论。返回 (新评论原始列表, error)。"""
     collected: Dict[str, dict] = {}
@@ -757,6 +758,17 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
     page_failure = ""
 
     async def on_response(resp):
+        if work_metadata is not None and FEED_API in resp.url:
+            try:
+                data = (await resp.json()).get("data") or {}
+                for item in data.get("items") or []:
+                    card = item.get("note_card") or {}
+                    if str(card.get("note_id") or item.get("id") or "") == note_id:
+                        title = card.get("title") or card.get("display_title") or card.get("desc")
+                        if title:
+                            work_metadata["title"] = title
+            except Exception:
+                pass
         if COMMENT_API in resp.url:
             try:
                 data = (await resp.json()).get("data") or {}
@@ -798,6 +810,14 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
                     mgr, page, collected, max_scrolls, known_cids)
             if not collected:
                 page_failure = await _xhs_page_failure(page)
+            if work_metadata is not None and not work_metadata.get("title") and not page_failure:
+                try:
+                    card = _decamel(json.loads(await page.evaluate(_SSR_NOTE_DETAIL_JS, note_id) or "{}"))
+                    title = card.get("title") or card.get("display_title") or card.get("desc")
+                    if title:
+                        work_metadata["title"] = title
+                except Exception:
+                    pass
         if not collected and not error:
             error = page_failure or "未拦截到评论（笔记可能暂无评论，或 xsec_token 已过期）"
     except Exception as e:
