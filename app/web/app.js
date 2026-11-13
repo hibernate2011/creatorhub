@@ -1220,11 +1220,6 @@ function applyPlatformUI() {
     ? "笔记 / 创作者主页 / 完整分享文案 / ID"
     : PLATFORM === "kuaishou" ? "作品 / 创作者主页 / 完整分享文案 / ID"
     : "视频 / 账号主页 / 完整分享文案 / ID";
-  if ($("w-url")) $("w-url").placeholder = PLATFORM === "xhs"
-    ? "直接粘贴整段小红书分享文案，将自动提取笔记或主页链接"
-    : PLATFORM === "kuaishou" ? "直接粘贴整段快手分享文案，将自动提取作品或主页链接"
-    : PLATFORM === "tiktok" ? "直接粘贴整段 TikTok 分享文案，将自动提取视频或主页链接"
-    : "直接粘贴整段抖音分享文案，将自动提取视频或主页链接";
   resetWatchTargetState();
   const ckl = $("ck-label");
   if (ckl) ckl.textContent = PLATFORM === "xhs"
@@ -1277,6 +1272,19 @@ function resetSmartTargetState(inputId, feedbackId, message) {
   setSmartTargetFeedback(feedbackId, message);
 }
 
+async function shareTargetLinks(text) {
+  const result = await api("/api/share-download/links", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ share_text: text, limit: 20 }),
+  });
+  return Array.isArray(result.links) ? result.links : [];
+}
+
+function shareTargetPlatformMismatch(links, platform) {
+  const names = [...new Set(links.map(item => smartTargetPlatformName(item?.platform)))].join("、");
+  return `识别到${names}链接，与当前${smartTargetPlatformName(platform)}页面不匹配`;
+}
+
 async function normalizePlatformShareTarget({
   inputId, feedbackId, platform, button = null, quiet = false,
 }) {
@@ -1295,12 +1303,8 @@ async function normalizePlatformShareTarget({
   input.removeAttribute("aria-invalid");
   setSmartTargetFeedback(feedbackId, "正在清洗分享文案并识别链接…", "parsing");
   try {
-    const result = await api("/api/share-download/links", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ share_text: raw, limit: 20 }),
-    });
+    const links = await shareTargetLinks(raw);
     if (seq !== SMART_TARGET_PARSE_SEQ[inputId]) return input.value.trim();
-    const links = Array.isArray(result.links) ? result.links : [];
     if (!links.length) {
       setSmartTargetFeedback(feedbackId, "未发现链接，将按作品或用户 ID 直接解析");
       if (!quiet) toast("没有发现链接；也可以直接填写作品或用户 ID", "err");
@@ -1308,8 +1312,7 @@ async function normalizePlatformShareTarget({
     }
     const matched = links.find(item => item && item.platform === platform);
     if (!matched) {
-      const names = [...new Set(links.map(item => smartTargetPlatformName(item.platform)))].join("、");
-      const message = `识别到${names}链接，与当前${smartTargetPlatformName(platform)}页面不匹配`;
+      const message = shareTargetPlatformMismatch(links, platform);
       input.setAttribute("aria-invalid", "true");
       setSmartTargetFeedback(feedbackId, message, "error");
       if (!quiet) toast(message, "err");
@@ -1367,25 +1370,55 @@ function handleMonitorTargetKeydown(event) {
 function resetWatchTargetState() {
   resetSmartTargetState(
     "w-url", "w-url-feedback",
-    "支持完整分享文案、作品链接、创作者主页、平台短链或 ID",
+    "每行一个目标，整批共用下方配置。混合添加作品和账号时，请选择自动识别。",
   );
+  if ($("w-msg")) $("w-msg").textContent = "";
 }
 
-function normalizeWatchTarget(button = null, options = {}) {
-  return normalizePlatformShareTarget({
-    inputId: "w-url", feedbackId: "w-url-feedback", platform: PLATFORM,
-    button, quiet: !!options.quiet,
+function watchTargetLines(raw) {
+  return raw.split(/\r\n?|\n/).map((value, index) => ({ value: value.trim(), line: index + 1 }))
+    .filter(target => target.value);
+}
+
+async function normalizeWatchTargets(button = null) {
+  const input = $("w-url");
+  if (input.readOnly || button?.disabled) return;
+  const targets = watchTargetLines(input.value);
+  if (!targets.length) return;
+  const lines = input.value.split(/\r\n?|\n/);
+  const platform = PLATFORM;
+  resetWatchTargetState();
+  const seq = SMART_TARGET_PARSE_SEQ["w-url"];
+  setSmartTargetFeedback("w-url-feedback", "正在逐行识别…", "parsing");
+  await withBusy(button, "识别中", async () => {
+    let recognized = 0;
+    const errors = [];
+    for (const { value, line } of targets) {
+      try {
+        const links = await shareTargetLinks(value);
+        const matched = links.find(item => item?.platform === platform);
+        if (matched?.url) {
+          lines[line - 1] = matched.url;
+          recognized++;
+        } else if (links.length && !matched) {
+          errors.push(`第 ${line} 行 · ${shareTargetPlatformMismatch(links, platform)}`);
+        }
+      } catch {
+        errors.push(`第 ${line} 行 · 识别失败，提交时将重新解析`);
+      }
+      if (seq !== SMART_TARGET_PARSE_SEQ["w-url"]) return;
+    }
+    const message = `已识别 ${recognized} 条链接` +
+      (targets.length > recognized + errors.length ? "，其余目标将按 ID 解析" : "");
+    const cleaned = lines.join("\n");
+    if (cleaned !== input.value) input.value = cleaned;
+    if (errors.length) input.setAttribute("aria-invalid", "true");
+    setSmartTargetFeedback("w-url-feedback", [message, ...errors].join("\n"), errors.length ? "error" : "success");
   });
 }
 
 function handleWatchTargetPaste() {
-  setTimeout(() => normalizeWatchTarget(null, { quiet: true }), 0);
-}
-
-function handleWatchTargetKeydown(event) {
-  if (!event || event.key !== "Enter" || event.isComposing) return;
-  event.preventDefault();
-  addWatch();
+  setTimeout(() => normalizeWatchTargets(), 0);
 }
 
 function resetDanmakuTargetState() {
@@ -7112,44 +7145,84 @@ const SRC = { public: "公开", creator: "创作中心" };
 async function addWatch() {
   const btn = evtBtn() || document.querySelector('button[onclick="addWatch()"]');
   if (btn?.disabled) return;
-  await withBusy(btn, "识别中", async () => {
-  const normalizedTarget = await normalizeWatchTarget(null, { quiet: true });
-  if (normalizedTarget === null) return;
-  const url_or_id = $("w-url").value.trim();
-  if (!url_or_id) { toast("请粘贴视频链接 / 账号主页 / sec_uid", "err"); return; }
-  if (["xhs", "tiktok"].includes(PLATFORM) && !$("w-acc").value) {
-    const platformName = PF_NAME[PLATFORM] || "当前平台";
-    const available = PLATFORM === "tiktok"
+  const input = $("w-url");
+  const raw = input.value;
+  const targets = watchTargetLines(raw);
+  if (!targets.length) { toast("请输入作品链接、账号主页或 ID", "err"); return; }
+  const platform = PLATFORM;
+  const accountId = $("w-acc").value;
+  if (["xhs", "tiktok"].includes(platform) && !accountId) {
+    const platformName = PF_NAME[platform] || "当前平台";
+    const available = platform === "tiktok"
       ? ACCOUNTS.filter(a => a.status === "active" && a.has_storage)
       : ACCOUNTS;
     if (!available.length) { toast("请先在「账号」里完成" + platformName + "登录", "err"); switchTab("accounts"); return; }
     toast(platformName + "评论监控必须选择一个已登录账号", "err"); return;
   }
-  $("w-msg").textContent = "解析中…";
-  await withBusy(btn, "解析中", async () => {
+  await withBusy(btn, "添加中", async () => {
+    resetWatchTargetState();
+    const status = $("w-msg");
+    let config;
     try {
-      await api("/api/comment-watches", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url_or_id, platform: PLATFORM, kind: $("w-kind").value,
-          mode: PLATFORM === "douyin" ? $("w-mode").value : "public",
-          account_id: $("w-acc").value ? +$("w-acc").value : null,
-          interval_seconds: monitorIntervalSeconds("w-interval"),
-          recent_works: +$("w-recent").value,
-          recent_days: +$("w-days").value,
-          max_scrolls: +$("w-depth").value,
-          alias: $("w-alias").value.trim(), group_name: getMetaValue("w-group").trim(),
-          tags: parseTags(getMetaValue("w-tags")),
-        }),
-      });
-      ["w-url", "w-alias"].forEach(id => $(id).value = "");
-      setMetaValue("w-group", ""); setMetaValue("w-tags", "");
-      resetWatchTargetState();
-      $("w-msg").textContent = "已添加 ✓"; toast("已开始监控评论", "ok");
-      globalThis.CreatorHubWorkbench?.completed?.("comments");
-    } catch (e) { $("w-msg").textContent = "失败: " + e.message; toast("添加失败:" + e.message, "err"); }
-  });
-  refreshWatches();
+      config = {
+        platform, kind: $("w-kind").value,
+        mode: platform === "douyin" ? $("w-mode").value : "public",
+        account_id: accountId ? +accountId : null,
+        interval_seconds: monitorIntervalSeconds("w-interval"),
+        recent_works: +$("w-recent").value,
+        recent_days: +$("w-days").value,
+        max_scrolls: +$("w-depth").value,
+        alias: $("w-alias").value.trim(), group_name: getMetaValue("w-group").trim(),
+        tags: parseTags(getMetaValue("w-tags")),
+      };
+    } catch (e) {
+      status.textContent = e.message;
+      toast(e.message, "err");
+      return;
+    }
+    const isCurrent = () => PLATFORM === platform && input.value === raw;
+    const failures = [];
+    let added = 0;
+    let existing = 0;
+    input.readOnly = true;
+    try {
+      for (const [index, { value, line }] of targets.entries()) {
+        if (isCurrent()) status.textContent = `正在添加 ${index + 1} / ${targets.length}…`;
+        try {
+          await api("/api/comment-watches", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...config, url_or_id: value }),
+          });
+          added++;
+        } catch (e) {
+          if (e.status === 409) existing++;
+          else failures.push({ value, message: `原第 ${line} 行 · ${e.message}` });
+        }
+      }
+    } finally {
+      input.readOnly = false;
+    }
+    const summary = `已添加 ${added} 条` +
+      (existing ? `，${existing} 条已存在` : "") +
+      (failures.length ? `，${failures.length} 条失败` : "");
+    const current = isCurrent();
+    if (current) {
+      input.value = failures.map(item => item.value).join("\n");
+      status.textContent = summary;
+      if (failures.length) {
+        input.setAttribute("aria-invalid", "true");
+        setSmartTargetFeedback("w-url-feedback", failures.map(item => item.message).join("\n"), "error");
+      } else if (added) {
+        $("w-alias").value = "";
+        setMetaValue("w-group", ""); setMetaValue("w-tags", "");
+        globalThis.CreatorHubWorkbench?.completed?.("comments");
+      }
+    }
+    if ((added || existing) && PLATFORM === platform) refreshWatches().catch(() => {});
+    if (!current || !failures.length) {
+      const message = current ? summary : `${smartTargetPlatformName(platform)}评论监控：${summary}`;
+      toast(message, failures.length ? "err" : added ? "ok" : "info");
+    }
   });
 }
 function watchRow(w) {

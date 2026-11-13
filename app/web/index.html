@@ -629,7 +629,8 @@
   button.input-action:hover { color:var(--fg); background:var(--surface-2); filter:none; }
   button.input-action:active { transform:translateY(-50%); }
   .smart-target-input { position:relative; }
-  .smart-target-input > input { padding-right:98px; }
+  .smart-target-input > input, .smart-target-input > textarea { padding-right:98px; }
+  .smart-target-input > textarea { display:block; }
   .smart-target-action {
     position:absolute; top:50%; right:5px; transform:translateY(-50%);
     min-height:30px; padding:5px 9px; gap:5px; border:0; border-radius:7px;
@@ -638,6 +639,8 @@
   .smart-target-action svg { width:14px; height:14px; }
   .smart-target-action:hover { color:var(--fg); background:var(--surface-2); filter:none; }
   .smart-target-action:active { transform:translateY(-50%) scale(.985); }
+  .smart-target-input > textarea + .smart-target-action { top:5px; transform:none; }
+  .smart-target-input > textarea + .smart-target-action:active:not(:disabled) { transform:scale(.985); }
   .smart-target-feedback {
     display:flex; align-items:center; gap:6px; min-height:19px; margin-top:5px;
     color:var(--mut-2); font-size:11.5px; line-height:1.45;
@@ -649,6 +652,7 @@
   .smart-target-feedback.parsing { color:var(--info); }
   .smart-target-feedback.success { color:var(--success); }
   .smart-target-feedback.error { color:var(--danger); }
+  #w-url-feedback { align-items:baseline; white-space:pre-line; overflow-wrap:anywhere; }
   .switch-row {
     display:flex; align-items:center; gap:11px; padding:11px 12px;
     color:var(--fg); background:var(--control-bg); border:1px solid var(--line-soft); border-radius:var(--r-sm); cursor:pointer;
@@ -3284,17 +3288,17 @@
         <div>
           <label class="field" for="w-url" id="w-url-label">作品 / 创作者主页 / 完整分享文案 / ID</label>
           <div class="smart-target-input">
-            <input id="w-url" maxlength="100000" autocomplete="off"
-              placeholder="直接粘贴整段分享文案，将自动提取作品或主页链接"
+            <textarea id="w-url" rows="4" maxlength="100000" autocomplete="off"
+              placeholder="每行输入一个作品或账号，支持链接、分享文案或 ID"
               onpaste="handleWatchTargetPaste()" oninput="resetWatchTargetState()"
-              onkeydown="handleWatchTargetKeydown(event)">
-            <button type="button" class="smart-target-action" onclick="normalizeWatchTarget(this)"
+              aria-describedby="w-url-feedback"></textarea>
+            <button type="button" class="smart-target-action" onclick="normalizeWatchTargets(this)"
               aria-label="识别并清洗评论监控分享文案" title="识别并清洗分享文案">
               <svg><use href="#i-bolt"/></svg><span>识别</span>
             </button>
           </div>
           <div class="smart-target-feedback" id="w-url-feedback" role="status" aria-live="polite">
-            支持完整分享文案、作品链接、创作者主页、平台短链或 ID
+            每行一个目标，整批共用下方配置。混合添加作品和账号时，请选择自动识别。
           </div>
         </div>
         <div class="form-grid cols-auto">

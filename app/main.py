@@ -9387,6 +9387,7 @@ async def add_watch(body: WatchIn):
                          .where(CommentWatch.aweme_id == aweme_id)).first()
         else:
             dup = s.exec(select(CommentWatch).where(CommentWatch.platform == platform)
+                         .where(CommentWatch.kind != "video")
                          .where(CommentWatch.sec_uid == sec_uid)
                          .where(CommentWatch.mode == mode)).first()
         if dup:

@@ -194,6 +194,22 @@ def test_tiktok_comment_route_creates_pending_reply_task(tiktok_account):
         assert task.target_text == "Original comment"
 
 
+def test_tiktok_comment_watch_allows_video_and_its_author(tiktok_account):
+    async def create(target):
+        return await main.add_watch(main.WatchIn(
+            platform="tiktok", account_id=tiktok_account, url_or_id=target,
+        ))
+
+    video_url = "https://www.tiktok.com/@alice/video/731"
+    profile_url = "https://www.tiktok.com/@alice"
+    assert asyncio.run(create(video_url))["kind"] == "video"
+    assert asyncio.run(create(profile_url))["kind"] == "user"
+    for target in (video_url, profile_url):
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(create(target))
+        assert error.value.status_code == 409
+
+
 def test_tiktok_ui_exposes_supported_features_and_video_publish():
     root = Path(__file__).parents[1]
     html = (root / "app" / "web" / "index.html").read_text(encoding="utf-8")
