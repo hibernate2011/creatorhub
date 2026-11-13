@@ -489,7 +489,6 @@ def lead_text(row):
     except (OverflowError, OSError, ValueError):
         pass
     lines = [f"潜客置信度：{row.confidence:.1%}", f"平台：{row.platform}",
-             f"作品：{clean_work_title(row.work_title, row.aweme_id)[:500] or '未获取到标题'}",
              f"用户：{row.user_nickname[:100]}",
              f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"]
     if row.platform in work_urls and row.aweme_id:

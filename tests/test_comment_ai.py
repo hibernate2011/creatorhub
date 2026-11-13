@@ -171,13 +171,14 @@ class CommentAITests(unittest.TestCase):
             asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id], retry_failed=True)))
             asyncio.run(ai.process_delivery())
             self.assertEqual(send.await_count, 1)
-            self.assertIn("装修服务", send.call_args.args[3])
+            self.assertIn("评论：多少钱？想预约", send.call_args.args[3])
 
     def test_lead_message_links_and_omits_internal_fields(self):
         row = CommentAnalysis(id="a", platform="douyin", aweme_id="work", comment_id="private-comment",
             user_sec_uid="profile-id", user_nickname="客户", text="咨询", work_title="作品标题",
             confidence=.85, prompt_name="internal-prompt")
         text = ai.lead_text(row)
+        self.assertNotIn("作品：", text)
         self.assertIn("作品链接：https://www.douyin.com/video/work", text)
         self.assertIn("用户主页：https://www.douyin.com/user/profile-id", text)
         self.assertNotIn("private-comment", text)
@@ -305,7 +306,7 @@ class CommentAITests(unittest.TestCase):
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             self.assertTrue(asyncio.run(ai.process_delivery()))
             body = send.call_args.args[3]
-            self.assertIn("作品：装修服务真实标题", body)
+            self.assertNotIn("作品：", body)
             self.assertIn("作品链接：https://www.douyin.com/video/w1", body)
 
         raw_comment = {"cid": "new", "text": "怎么预约", "create_time": 1}
