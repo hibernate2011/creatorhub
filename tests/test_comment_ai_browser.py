@@ -24,10 +24,13 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     dialog.get_by_role("textbox", name="OpenRouter API Key").fill("fixture-key")
     dialog.get_by_role("checkbox", name="抓取新评论后自动分析").check()
     dialog.get_by_role("checkbox", name="分析完成后按各目标阈值自动转发").check()
+    dialog.get_by_role("group", name="默认提示词 · v1").get_by_role(
+        "textbox", name="排除的业务或行业关键词").fill("二手车")
     dialog.get_by_role("button", name="添加领域提示词").click()
     rule = dialog.get_by_role("group", name="自定义提示词 · v1")
     rule.get_by_role("textbox", name="名称", exact=True).fill("装修客户")
     rule.get_by_role("textbox", name="判断标准").fill("询价或预约上门视为潜在客户")
+    rule.get_by_role("textbox", name="排除的业务或行业关键词").fill("跨境物流，金融科技")
     rule.locator('select[multiple]').select_option(["21", "22"])
     assert rule.locator('select[multiple]').evaluate("el => el.selectedOptions.length") == 2
     dialog.get_by_role("button", name="添加钉钉 / 飞书目标").click()
@@ -51,9 +54,14 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     assert posted["prompts"][1]["watch_ids"] == [21, 22]
     assert posted["destinations"][0]["type"] == "feishu"
     assert posted["destinations"][0]["threshold"] == .85
+    assert [p["exclude_keywords"] for p in posted["prompts"]] == [["二手车"], ["跨境物流", "金融科技"]]
 
     page.get_by_role("button", name="AI 潜客分析配置", exact=True).click()
     expect(dialog.get_by_role("textbox", name="OpenRouter API Key")).to_have_value("********")
+    expect(dialog.get_by_role("group", name="默认提示词 · v2").get_by_role(
+        "textbox", name="排除的业务或行业关键词")).to_have_value("二手车")
+    expect(dialog.get_by_role("group", name="自定义提示词 · v2").get_by_role(
+        "textbox", name="排除的业务或行业关键词")).to_have_value("跨境物流\n金融科技")
     expect(dialog.get_by_role("group", name="自定义提示词 · v2")).to_be_visible()
     dialog.get_by_role("button", name="取消", exact=True).click()
     page.get_by_role("tab", name="评论记录", exact=True).click()
@@ -61,6 +69,7 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     records.locator('input[type="checkbox"]').first.check()
     page.get_by_role("button", name="分析所选", exact=True).click()
     expect(records).to_contain_text("潜客置信度 91.0%")
+    expect(records).not_to_contain_text("潜客判断：")
     assert len(json.loads(page.locator('html').get_attribute('data-fixture-ai-requests'))[-1]['body']['ids']) == 1
     page.get_by_role("button", name="按阈值转发所选", exact=True).click()
     expect(records).to_contain_text("销售群：已转发")
@@ -81,6 +90,7 @@ def test_watch_ai_policy_editor_saves_and_restores_custom_destinations(ui):
     page.add_script_tag(path=str(Path(__file__).parent / "fixtures/comment-ai-api.js"))
     navigate(page, "comments")
     edit = page.locator("#watch-table").get_by_role("button", name="编辑", exact=True).first
+    previous_edit = edit.element_handle()
     edit.click()
     dialog = page.get_by_role("dialog", name="编辑评论监控")
     for label, option in [("抓取后自动分析", "关闭"), ("分析结果推送", "开启"),
@@ -96,7 +106,7 @@ def test_watch_ai_policy_editor_saves_and_restores_custom_destinations(ui):
     assert posted["ai_policy"]["auto_analyze"] == "off"
     assert posted["ai_policy"]["auto_forward"] == "on"
     assert posted["ai_policy"]["destination_mode"] == "custom"
-    page.wait_for_function("document.querySelector('#watch-table button[onclick^=editWatchMeta]')")
+    page.wait_for_function("button => !button.isConnected", arg=previous_edit)
     edit.click()
     expect(dialog.get_by_role("textbox", name="Webhook 地址")).to_have_value("********")
     assert errors == []

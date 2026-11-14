@@ -7,11 +7,13 @@ let COMMENT_AI_FIELD = 0;
 function commentAIMarkup(row) {
   const ai = row.ai || {status: 'unanalyzed'};
   const score = ai.confidence == null ? '' : `<strong>潜客置信度 ${(ai.confidence * 100).toFixed(1)}%</strong>`;
+  const exclusion = ai.excluded_by_model ? '<span>AI 判定命中排除规则</span>'
+    : ai.excluded_keyword ? `<span>命中排除关键词：${esc(ai.excluded_keyword)}</span>` : '';
   const deliveries = (ai.deliveries || []).map(d => `<span title="${esc(d.error || '')}">${esc(d.name || d.destination_id)}：${d.status === 'failed' ? '转发失败' : esc(COMMENT_AI_LABELS[d.status] || d.status)}${d.status === 'failed' ? ` <button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('forward',true,${row.id})">${ic("i-refresh")}重试转发</button>` : ''}</span>`).join(' · ');
   const retry = ai.status === 'failed' ? `<button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',true,${row.id})">${ic("i-refresh")}重试分析</button>` : '';
   const refreshTitle = ai.can_refresh_title ? `<button type="button" class="ghost sm wb-secondary-action" onclick="commentAIAction('analyze',false,${row.id},true)">${ic("i-refresh")}补标题并重新分析</button>` : '';
   return `<div class="comment-record-ai" title="${esc(ai.error || '')}"><div class="comment-record-ai-summary">
-    <span class="comment-record-ai-status" data-status="${esc(ai.status)}">${esc(COMMENT_AI_LABELS[ai.status] || ai.status)}</span>${score}
+    <span class="comment-record-ai-status" data-status="${esc(ai.status)}">${esc(COMMENT_AI_LABELS[ai.status] || ai.status)}</span>${score}${exclusion}
     ${ai.prompt_id ? `<span>${esc(ai.prompt_name || ai.prompt_id)} v${ai.prompt_version}</span>` : ''}${retry}${refreshTitle}</div>
     ${ai.error ? `<div>${esc(ai.error)}</div>` : ''}${deliveries ? `<div>${deliveries}</div>` : ''}</div>`;
 }
@@ -66,6 +68,8 @@ function commentAIAddPrompt(prompt = null) {
     <legend>${isDefault ? '默认提示词' : '自定义提示词'} · v${Number(p.version) || 1}</legend>
     ${commentAIField('名称', `<input data-field="name" value="${esc(p.name)}" maxlength="80">`)}
     ${commentAIField('判断标准', `<textarea data-field="text" rows="6" maxlength="12000">${esc(p.text)}</textarea>`)}
+    ${commentAIField('排除的业务或行业关键词', `<textarea data-field="exclude_keywords" rows="3" aria-describedby="cai-exclude-help-${esc(p.id)}">${esc((p.exclude_keywords || []).join('\n'))}</textarea>`)}
+    <p class="field-help" id="cai-exclude-help-${esc(p.id)}">逗号或换行分隔。AI 结合评论和作品标题判断语义，命中排除范围时潜客置信度记为 0%，并跳过转发。</p>
     ${!isDefault ? `${commentAIField('适用平台', `<select data-field="platform">${platformOptions.map(([v, label]) => `<option value="${v}" ${v === p.platform ? 'selected' : ''}>${label}</option>`).join('')}</select>`)}
       ${commentAIField('指定账号或作品监控（可多选；Ctrl / Cmd 加选）', `<select data-field="watch_ids" multiple size="5">${watchOptions}${missing}</select>`)}
       ${commentAIField('作品 ID（多个用逗号分隔，需指定平台）', `<input data-field="work_ids" value="${esc(p.work_ids.join(', '))}">`)}
@@ -133,6 +137,7 @@ function commentAIReadSettings() {
   const prompts = [...$('cai-prompts').querySelectorAll('[data-prompt]')].map(node => {
     const field = name => node.querySelector(`[data-field="${name}"]`);
     return {id: node.dataset.prompt, name: field('name').value.trim(), text: field('text').value.trim(),
+      exclude_keywords: commentAISplit(field('exclude_keywords').value),
       platform: field('platform')?.value || '', enabled: field('enabled')?.checked ?? true,
       watch_ids: [...(field('watch_ids')?.selectedOptions || [])].map(o => +o.value),
       work_ids: commentAISplit(field('work_ids')?.value || ''), groups: commentAISplit(field('groups')?.value || '')};

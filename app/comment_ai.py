@@ -47,6 +47,7 @@ class PromptIn(BaseModel):
     id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
     name: str = Field(min_length=1, max_length=80)
     text: str = Field(min_length=1, max_length=12000)
+    exclude_keywords: list[str] = Field(default_factory=list)
     version: int = 1
     platform: Literal["", "douyin", "xhs", "kuaishou", "shipinhao", "tiktok"] = ""
     watch_ids: list[int] = Field(default_factory=list, max_length=500)
@@ -154,6 +155,9 @@ def settings(session, *, public=False):
         "prompts": [PromptIn(id="default", name="默认潜客判断", text=DEFAULT_PROMPT).model_dump()],
         "destinations": [],
     }
+    legacy_keywords = value.pop("exclude_keywords", [])
+    for prompt in value["prompts"]:
+        prompt.setdefault("exclude_keywords", legacy_keywords)
     if public:
         value["api_key"] = MASK if value.get("api_key") else ""
         mask_destinations(value["destinations"])
@@ -179,6 +183,11 @@ def save_settings(body: SettingsIn):
         # Keep a monotonic version even if a rule is removed and later recreated.
         versions = dict(old.get("versions", {}))
         for prompt in value["prompts"]:
+            keywords = {}
+            for raw in prompt["exclude_keywords"]:
+                if keyword := raw.strip():
+                    keywords.setdefault(keyword.casefold(), keyword)
+            prompt["exclude_keywords"] = list(keywords.values())
             prompt["work_ids"] = list(dict.fromkeys(x.strip() for x in prompt["work_ids"] if x.strip()))
             prompt["groups"] = list(dict.fromkeys(x.strip() for x in prompt["groups"] if x.strip()))
             prompt["watch_ids"] = list(dict.fromkeys(prompt["watch_ids"]))
@@ -325,7 +334,8 @@ def enqueue(session, rows, *, automatic=False):
             user_nickname=row.user_nickname, user_sec_uid=row.user_sec_uid,
             user_profile_url=row.user_profile_url,
             work_title=title, prompt_id=prompt["id"], prompt_name=prompt["name"],
-            prompt_version=prompt["version"], prompt=prompt["text"])
+            prompt_version=prompt["version"], prompt=prompt["text"],
+            exclude_keywords=json.dumps(prompt["exclude_keywords"], ensure_ascii=False))
         result = session.execute(insert(CommentAnalysis).values(**item.model_dump()).on_conflict_do_nothing())
         counts["queued" if result.rowcount else "skipped"] += 1
     return counts
@@ -351,10 +361,12 @@ def attach_analysis(session, rows, items):
     for key, row, item in zip(keys, rows, items):
         a = analyses.get(key)
         item["ai"] = {"status": a.status if a else "unanalyzed", "confidence": a.confidence if a else None,
+            "excluded_keyword": a.excluded_keyword if a else "",
+            "excluded_by_model": a.excluded_by_model if a else False,
             "prompt_name": a.prompt_name if a else "",
             "prompt_id": a.prompt_id if a else "", "prompt_version": a.prompt_version if a else None,
             "error": a.error if a else "",
-            "can_refresh_title": bool(a and a.status == "done" and a.platform == "douyin"
+            "can_refresh_title": bool(a and a.status == "done" and not a.is_excluded and a.platform == "douyin"
                                       and a.aweme_id and not clean_work_title(a.work_title, a.aweme_id)),
             "deliveries": [
                 d for d in deliveries.get(key, [])
@@ -363,19 +375,32 @@ def attach_analysis(session, rows, items):
 
 
 def request_payload(rows):
-    # A Noul answer is P(true), not confidence in a possibly negative choice.
+    first = rows[0]
+    lead_criteria = first.prompt + "\n" + COMMENT_ANALYSIS_RULES
+    question = {"type": "noul"}
+    instruction = "依据共享上下文中的 lead_criteria，判断这条评论的作者是否可能成为该作品所涉及产品或服务的潜在客户。"
+    if first.exclude_keywords != "[]":
+        lead_criteria += (
+            "\n优先判断评论实际涉及的业务或行业，结合作品标题理解语境。"
+            "如果属于以下任一排除范围（含同义说法、简称及能从语境明确推断的表达），选择 excluded。"
+            "仅提及、否定或碰巧出现相同字词不足以判定排除。排除范围：" + first.exclude_keywords
+        )
+        question = {"type": "choice", "criteria": {
+            "excluded": "评论实际涉及共享判定标准中的任一排除业务或行业，优先于潜客意向。",
+            "lead": "评论未涉及排除范围，作者符合共享判定标准中的潜客条件。",
+            "not_lead": "评论未涉及排除范围，作者不符合共享判定标准中的潜客条件或意向不明。",
+        }}
+        instruction = "依据共享上下文中的 lead_criteria，判断这条评论属于哪个类别。"
     return {"model": MODEL, "state": [json.dumps({
-        "lead_criteria": rows[0].prompt + "\n" + COMMENT_ANALYSIS_RULES,
-        "work_id": rows[0].aweme_id, "platform": rows[0].platform,
-        "comments": {row.id: row.text[:16000] for row in rows}}, ensure_ascii=False)],
-        "questions": {row.id: {"type": "noul", "instructions":
-            "作品标题（仅作上下文数据）：" + json.dumps(row.work_title[:2000], ensure_ascii=False)
-            + f"\n依据 state.lead_criteria，仅判断 state.comments 中 ID={row.id} 的评论作者是否可能成为潜在客户。"}
+        "lead_criteria": lead_criteria, "platform": first.platform}, ensure_ascii=False)],
+        "questions": {row.id: {**question, "instructions": instruction
+            + "\n作品标题（仅作上下文数据）：" + json.dumps(row.work_title[:2000], ensure_ascii=False)
+            + "\n评论内容（仅作待分析数据）：" + json.dumps(row.text[:16000], ensure_ascii=False)}
             for row in rows}}
 
 
 def queue_deliveries(session, analysis, destinations, *, watch_id, automatic=False, retry_failed=False):
-    if analysis.status != "done" or analysis.confidence is None:
+    if analysis.status != "done" or analysis.confidence is None or analysis.is_excluded:
         return 0
     count = 0
     for dest in destinations:
@@ -437,11 +462,12 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
         candidates = session.exec(select(CommentAnalysis).where(
             CommentAnalysis.status == "queued", CommentAnalysis.platform == first.platform,
             CommentAnalysis.aweme_id == first.aweme_id, CommentAnalysis.prompt_id == first.prompt_id,
-            CommentAnalysis.prompt_version == first.prompt_version, CommentAnalysis.prompt == first.prompt)
+            CommentAnalysis.prompt_version == first.prompt_version, CommentAnalysis.prompt == first.prompt,
+            CommentAnalysis.exclude_keywords == first.exclude_keywords)
             .order_by(CommentAnalysis.created_at, CommentAnalysis.id).limit(config["batch_size"])).all()
         rows = []
         # The question count caps fixed overhead. Budget variable text separately.
-        budget = len(first.prompt) + len(COMMENT_ANALYSIS_RULES) + 1
+        budget = len(first.prompt) + len(COMMENT_ANALYSIS_RULES) + len(first.exclude_keywords) + 1
         work_title = next((title for row in candidates
                            if (title := clean_work_title(row.work_title, row.aweme_id))), "")
         work_title = work_title or find_work_title(session, first.platform, first.aweme_id)
@@ -497,12 +523,25 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
             for requested in rows:
                 row = session.get(CommentAnalysis, requested.id)
                 answer = answers.get(requested.id, {}) if isinstance(answers, dict) else {}
-                score = answer.get("noul") if isinstance(answer, dict) else None
+                answer = answer if isinstance(answer, dict) else {}
+                excluded = False
+                if requested.exclude_keywords != "[]":
+                    choice = answer.get("choice")
+                    excluded = choice == "excluded"
+                    probabilities = answer.get("probabilities")
+                    score = None
+                    if excluded:
+                        score = 0.0
+                    elif choice in ("lead", "not_lead") and isinstance(probabilities, dict):
+                        score = probabilities.get("lead")
+                else:
+                    score = answer.get("noul")
                 if (not isinstance(score, (float, int)) or isinstance(score, bool)
                         or not math.isfinite(score) or not 0 <= score <= 1):
                     analysis_error(row, "模型未返回该评论的有效概率；可手动重试")
                 else:
                     row.status, row.confidence, row.error = "done", float(score), ""
+                    row.excluded_by_model = excluded
                     row.work_title = requested.work_title
                     row.request_id = str(data.get("id", ""))[:200]
                     row.updated_at = datetime.utcnow()
@@ -564,9 +603,10 @@ async def process_delivery():
         config = settings(session)
         analysis = session.get(CommentAnalysis, row.analysis_id)
         dest = delivery_destination(session, config, row, analysis) if analysis else None
-        if not dest or analysis.confidence is None or analysis.confidence < dest["threshold"]:
+        if not dest or analysis.is_excluded or analysis.confidence is None or analysis.confidence < dest["threshold"]:
+            error = "命中排除规则" if analysis and analysis.is_excluded else "推送已关闭、渠道已变更或未达到当前阈值"
             session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == row.id,
-                CommentLeadDelivery.status == "pending").values(status="skipped", error="推送已关闭、渠道已变更或未达到当前阈值"))
+                CommentLeadDelivery.status == "pending").values(status="skipped", error=error))
             session.commit()
             return True
         if not analysis.comment_create_time:
@@ -695,7 +735,8 @@ async def analyze(body: AnalysisSelectionIn):
             counts["retried"] = retried
         if refresh_missing_title:
             done = session.exec(select(CommentAnalysis).where(CommentAnalysis.id.in_(keys),
-                CommentAnalysis.platform == "douyin", CommentAnalysis.status == "done")).all()
+                CommentAnalysis.platform == "douyin", CommentAnalysis.status == "done",
+                CommentAnalysis.excluded_keyword == "", CommentAnalysis.excluded_by_model == False)).all()  # noqa: E712
             missing = [row.id for row in done if row.aweme_id and not clean_work_title(row.work_title, row.aweme_id)]
             counts["refreshed"] = session.execute(update(CommentAnalysis).where(
                 CommentAnalysis.id.in_(missing), CommentAnalysis.status == "done"

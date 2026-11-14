@@ -421,13 +421,20 @@ class CommentAnalysis(SQLModel, table=True):
     prompt_name: str = ""
     prompt_version: int = 1
     prompt: str = ""
+    exclude_keywords: str = "[]"
     model: str = "google/gemini-decision-1"
     status: str = Field(default="queued", index=True)
     confidence: Optional[float] = Field(default=None, index=True)
+    excluded_keyword: str = ""
+    excluded_by_model: bool = False
     error: str = ""
     request_id: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @property
+    def is_excluded(self) -> bool:
+        return self.excluded_by_model or bool(self.excluded_keyword)
 
 
 class CommentLeadDelivery(SQLModel, table=True):

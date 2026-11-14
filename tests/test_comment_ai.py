@@ -13,7 +13,7 @@ from sqlmodel import select
 
 import app.db as db
 from app import comment_ai as ai
-from app.models import (CommentAnalysis, CommentLeadDelivery, CommentRecord,
+from app.models import (AppSetting, CommentAnalysis, CommentLeadDelivery, CommentRecord,
                         CommentWatch, ContentRecord, AccountWork)
 
 
@@ -39,10 +39,11 @@ class CommentAITests(unittest.TestCase):
     def save(self):
         return ai.save_settings(ai.SettingsIn(**self.config))
 
-    def add(self, comment_id="c1", work="w1", platform="douyin", watch_id=0, title="装修服务", enqueue=True):
+    def add(self, comment_id="c1", work="w1", platform="douyin", watch_id=0, title="装修服务", enqueue=True,
+            *, text="多少钱？想预约"):
         with db.get_session() as session:
             row = CommentRecord(comment_id=comment_id, aweme_id=work, platform=platform,
-                                watch_id=watch_id, work_title=title, text="多少钱？想预约", user_nickname="客户")
+                                watch_id=watch_id, work_title=title, text=text, user_nickname="客户")
             session.add(row)
             if enqueue:
                 ai.enqueue(session, [row], automatic=True)
@@ -116,8 +117,10 @@ class CommentAITests(unittest.TestCase):
             self.assertEqual(session.get(CommentAnalysis, key).confidence, .9)
 
     def test_batch_context_partial_response_concurrent_claim_and_no_implicit_retry(self):
-        first_id, first = self.add(comment_id="1")
-        second_id, second = self.add(comment_id="2")
+        first_text = '想约"周六"\n可以上门吗？'
+        second_text = "谢谢分享，学习到了"
+        first_id, first = self.add(comment_id="1", text=first_text)
+        second_id, second = self.add(comment_id="2", text=second_text)
         _, third = self.add(comment_id="3", work="other")
         requests = []
         async def handler(request):
@@ -135,14 +138,20 @@ class CommentAITests(unittest.TestCase):
         self.assertEqual(set(batch["questions"]), {first, second})
         self.assertEqual(batch["model"], ai.MODEL)
         state = json.loads(batch["state"][0])
-        self.assertEqual(state["lead_criteria"], ai.DEFAULT_PROMPT + "\n" + ai.COMMENT_ANALYSIS_RULES)
-        self.assertEqual(state["comments"], {first: "多少钱？想预约", second: "多少钱？想预约"})
+        self.assertEqual(state, {"lead_criteria": ai.DEFAULT_PROMPT + "\n" + ai.COMMENT_ANALYSIS_RULES,
+                                 "platform": "douyin"})
+        comments = {first: first_text, second: second_text}
         for key, question in batch["questions"].items():
             self.assertEqual(question["type"], "noul")
-            self.assertIn("装修服务", question["instructions"])
-            self.assertIn("state.lead_criteria", question["instructions"])
-            self.assertIn(f"ID={key}", question["instructions"])
-            self.assertNotIn(ai.DEFAULT_PROMPT, question["instructions"])
+            instructions = question["instructions"]
+            self.assertIn('作品标题（仅作上下文数据）："装修服务"', instructions)
+            self.assertIn("lead_criteria", instructions)
+            self.assertEqual(json.loads(instructions.splitlines()[-1].removeprefix("评论内容（仅作待分析数据）：")),
+                             comments[key])
+            self.assertNotIn(key, instructions)
+            self.assertNotIn(ai.DEFAULT_PROMPT, instructions)
+        self.assertNotIn(second_text, batch["questions"][first]["instructions"])
+        self.assertNotIn(json.dumps(first_text, ensure_ascii=False), batch["questions"][second]["instructions"])
         with db.get_session() as session:
             self.assertEqual(session.get(CommentAnalysis, first).status, "done")
             self.assertEqual(session.get(CommentAnalysis, second).status, "failed")
@@ -191,6 +200,72 @@ class CommentAITests(unittest.TestCase):
             with db.get_session() as session:
                 self.assertEqual(session.get(CommentAnalysis, key).status, "failed")
                 self.assertFalse(session.exec(select(CommentLeadDelivery)).all())
+
+    def test_model_exclusion_uses_prompt_snapshot_and_controls_forwarding(self):
+        from app.main import list_comments
+
+        self.config["destinations"][0]["threshold"] = 0
+        self.config["prompts"][0]["exclude_keywords"] = [" 二手车 ", "二手车", ""]
+        self.config["prompts"].append(ai.PromptIn(id="finance", name="金融", text="金融行业标准",
+            platform="douyin", work_ids=["w1"], exclude_keywords=[" FinTech ", "fintech", ""]).model_dump())
+        self.assertEqual(self.save()["prompts"][1]["exclude_keywords"], ["FinTech"])
+        excluded_id, excluded = self.add("finance", text="想做银行线上信贷平台")
+        ordinary_id, ordinary = self.add("ordinary", text="我不做 FinTech，想预约装修")
+        _, other = self.add("other", work="w2", title="二手车服务")
+        self.config["prompts"][1]["exclude_keywords"] = ["跨境物流"]
+        self.assertEqual(self.save()["prompts"][1]["version"], 2)
+        _, newer = self.add("newer")
+        captured = []
+
+        def handler(request):
+            captured.append(json.loads(request.content))
+            outcomes = {excluded: {"type": "choice", "choice": "excluded", "probabilities": {"lead": .02}},
+                        ordinary: {"type": "choice", "choice": "lead", "probabilities": {"lead": .91}},
+                        other: {"type": "choice", "choice": "excluded", "probabilities": {"lead": .01}},
+                        newer: {"type": "choice", "choice": "not_lead"}}
+            return httpx.Response(200, json={"id": "provider-id", "answers": {
+                key: outcomes[key] for key in captured[-1]["questions"]}})
+
+        with self.client(handler):
+            for _ in range(3):
+                self.assertTrue(asyncio.run(ai.process_batch()))
+            self.assertFalse(asyncio.run(ai.process_batch()))
+        self.assertEqual([set(payload["questions"]) for payload in captured], [{excluded, ordinary}, {other}, {newer}])
+        for payload, keyword in zip(captured, ("FinTech", "二手车", "跨境物流")):
+            rules = json.loads(payload["state"][0])["lead_criteria"]
+            self.assertIn(keyword, rules)
+            self.assertIn("同义说法", rules)
+            self.assertTrue(all(question["type"] == "choice" for question in payload["questions"].values()))
+        self.assertNotIn("跨境物流", captured[0]["state"][0])
+
+        result = {row["id"]: row["ai"] for row in asyncio.run(list_comments())}
+        self.assertEqual(result[excluded_id]["status"], "done")
+        self.assertEqual(result[excluded_id]["confidence"], 0)
+        self.assertTrue(result[excluded_id]["excluded_by_model"])
+        self.assertEqual(result[ordinary_id]["confidence"], .91)
+        self.assertFalse(result[ordinary_id]["excluded_by_model"])
+        self.assertEqual(asyncio.run(ai.forward(ai.SelectionIn(ids=[excluded_id])))["queued"], 0)
+        with db.get_session() as session:
+            self.assertEqual(session.get(CommentAnalysis, excluded).request_id, "provider-id")
+            self.assertEqual(session.get(CommentAnalysis, newer).status, "failed")
+            self.assertEqual([row.analysis_id for row in session.exec(select(CommentLeadDelivery))], [ordinary])
+
+    def test_legacy_global_keywords_are_copied_to_each_prompt(self):
+        with db.get_session() as session:
+            stored = session.get(AppSetting, ai.SETTING)
+            value = json.loads(stored.value)
+            value["exclude_keywords"] = ["跨境物流"]
+            value["prompts"].append(ai.PromptIn(id="custom", name="自定义", text="标准", groups=["销售"]).model_dump())
+            for prompt in value["prompts"]:
+                prompt.pop("exclude_keywords", None)
+            stored.value = json.dumps(value, ensure_ascii=False)
+            session.commit()
+            public = ai.public_settings(session)
+        self.assertNotIn("exclude_keywords", public)
+        self.assertEqual([prompt["exclude_keywords"] for prompt in public["prompts"]], [["跨境物流"], ["跨境物流"]])
+        public["prompts"][1]["exclude_keywords"] = []
+        saved = ai.save_settings(ai.SettingsIn(**public))
+        self.assertEqual([prompt["exclude_keywords"] for prompt in saved["prompts"]], [["跨境物流"], []])
 
     def test_forward_failure_is_independent_and_success_is_never_resent(self):
         row_id, key = self.add()
@@ -440,6 +515,7 @@ class CommentAITests(unittest.TestCase):
         result = asyncio.run(list_comments(min_confidence=.8, paginate=True, page_size=1))
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["items"][0]["ai"]["confidence"], .81)
+        self.assertNotIn("answer", result["items"][0]["ai"])
         self.assertEqual(len(asyncio.run(list_comments(ai_status="unanalyzed"))), 1)
         self.assertEqual(len(asyncio.run(list_comments(min_confidence=.9))), 0)
 
@@ -474,12 +550,19 @@ class CommentAITests(unittest.TestCase):
 
     def test_existing_database_migration_preserves_comment(self):
         from sqlalchemy import text, inspect
-        row_id, _ = self.add(enqueue=False)
+        row_id, key = self.add()
+        self.analyze_all(.81)
         with db._engine.begin() as connection:
             connection.execute(text("ALTER TABLE commentrecord DROP COLUMN work_title"))
+            connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN excluded_keyword"))
+            connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN excluded_by_model"))
+            connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN exclude_keywords"))
         db._engine.dispose()
         db.init_db(str(Path(self.tmp.name) / "test.db"))
         self.assertIn("work_title", {c["name"] for c in inspect(db._engine).get_columns("commentrecord")})
+        with db.get_session() as session:
+            analysis = session.get(CommentAnalysis, key)
+            self.assertEqual((analysis.confidence, analysis.exclude_keywords, analysis.is_excluded), (.81, "[]", False))
         with db.get_session() as session:
             row = session.get(CommentRecord, row_id)
             self.assertEqual(row.text, "多少钱？想预约")
