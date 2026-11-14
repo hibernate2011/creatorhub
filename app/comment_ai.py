@@ -392,7 +392,7 @@ def attach_analysis(session, rows, items):
 
 def request_payload(rows):
     first = rows[0]
-    state = {"lead_criteria": first.prompt + "\n" + COMMENT_ANALYSIS_RULES, "platform": first.platform}
+    state = {"lead_criteria": first.prompt + "\n" + COMMENT_ANALYSIS_RULES}
     question = {"type": "noul"}
     instruction = "依据共享上下文中的 lead_criteria，判断这条评论的作者是否可能成为该作品所涉及产品或服务的潜在客户。"
     if first.exclude_keywords != "[]":
@@ -413,6 +413,7 @@ def request_payload(rows):
         instruction = "依据共享的 lead_criteria 和 choice_criteria 对本评论分类。"
     return {"model": MODEL, "state": [json.dumps(state, ensure_ascii=False)],
         "questions": {row.id: {**question, "instructions": instruction
+            + "\n平台：" + json.dumps(row.platform, ensure_ascii=False)
             + "\n作品标题（仅作上下文数据）：" + json.dumps(row.work_title[:2000], ensure_ascii=False)
             + "\n用户昵称（仅作辅助线索）：" + json.dumps(row.user_nickname[:MAX_NICKNAME_LENGTH], ensure_ascii=False)
             + "\n评论内容（仅作待分析数据）：" + json.dumps(row.text[:16000], ensure_ascii=False)}
@@ -470,6 +471,38 @@ def analysis_error(row, message: str):
     row.updated_at = datetime.utcnow()
 
 
+async def fill_missing_douyin_titles(rows, load_douyin_title: DouyinTitleLoader | None):
+    missing = {}
+    for row in rows:
+        if row.platform == "douyin" and not row.work_title:
+            missing.setdefault(row.aweme_id, []).append(row)
+
+    for work_id, comments in missing.items():
+        title = ""
+        if load_douyin_title is not None:
+            source = comments[0]
+            try:
+                title = await asyncio.wait_for(
+                    load_douyin_title(work_id, source.watch_id, source.comment_id), timeout=75)
+            except Exception:
+                # A failed platform read affects only the comments for this work.
+                pass
+        with get_session() as session:
+            # The monitor may have saved the title while the detail read was in flight.
+            title = find_work_title(session, "douyin", work_id, title)
+            if title:
+                save_comment_work_title(session, "douyin", work_id, title)
+                for row in comments:
+                    row.work_title = title
+            else:
+                for row in comments:
+                    analysis_error(session.get(CommentAnalysis, row.id),
+                                   "未能取得抖音作品标题，请确认作品可访问后重试")
+            session.commit()
+
+    return [row for row in rows if row.platform != "douyin" or row.work_title]
+
+
 async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
     with get_session() as session:
         config = settings(session)
@@ -480,20 +513,25 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
         if not first:
             return False
         candidates = session.exec(select(CommentAnalysis).where(
-            CommentAnalysis.status == "queued", CommentAnalysis.platform == first.platform,
-            CommentAnalysis.aweme_id == first.aweme_id, CommentAnalysis.prompt_id == first.prompt_id,
+            CommentAnalysis.status == "queued", CommentAnalysis.prompt_id == first.prompt_id,
             CommentAnalysis.prompt_version == first.prompt_version, CommentAnalysis.prompt == first.prompt,
             CommentAnalysis.exclude_keywords == first.exclude_keywords)
             .order_by(CommentAnalysis.created_at, CommentAnalysis.id).limit(config["batch_size"])).all()
         rows = []
         # The question count caps fixed overhead. Budget variable text separately.
         budget = len(first.prompt) + len(COMMENT_ANALYSIS_RULES) + len(first.exclude_keywords) + 1
-        work_title = next((title for row in candidates
-                           if (title := clean_work_title(row.work_title, row.aweme_id))), "")
-        work_title = work_title or find_work_title(session, first.platform, first.aweme_id)
+        work_titles = {}
         for row in candidates:
-            title = clean_work_title(row.work_title, row.aweme_id) or work_title
-            title_size = 2000 if not title and first.platform == "douyin" else len(title[:2000])
+            if title := clean_work_title(row.work_title, row.aweme_id):
+                work_titles.setdefault((row.platform, row.aweme_id), title)
+        for row in candidates:
+            title = clean_work_title(row.work_title, row.aweme_id)
+            if not title:
+                work_key = (row.platform, row.aweme_id)
+                if work_key not in work_titles:
+                    work_titles[work_key] = find_work_title(session, *work_key)
+                title = work_titles[work_key]
+            title_size = 2000 if not title and row.platform == "douyin" else len(title[:2000])
             size = len(row.text[:16000]) + title_size + len(row.user_nickname[:MAX_NICKNAME_LENGTH])
             if rows and budget + size > 100000:
                 break
@@ -507,29 +545,9 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
         return False
     ids = [row.id for row in rows]
     try:
-        first = rows[0]
-        if first.platform == "douyin" and not work_title:
-            title = ""
-            if load_douyin_title is not None:
-                try:
-                    title = await asyncio.wait_for(
-                        load_douyin_title(first.aweme_id, first.watch_id, first.comment_id), timeout=75)
-                except TimeoutError:
-                    pass
-            title = clean_work_title(title, first.aweme_id)
-            with get_session() as session:
-                # The monitor may have saved the title while the detail read was in flight.
-                title = find_work_title(session, first.platform, first.aweme_id, title)
-                if not title:
-                    for key in ids:
-                        analysis_error(session.get(CommentAnalysis, key),
-                                       "未能取得抖音作品标题，请确认作品可访问后重试")
-                    session.commit()
-                    return True
-                save_comment_work_title(session, first.platform, first.aweme_id, title)
-                session.commit()
-            for row in rows:
-                row.work_title = title
+        rows = await fill_missing_douyin_titles(rows, load_douyin_title)
+        if not rows:
+            return True
         payload = request_payload(rows)
         async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
             response = await client.post(ENDPOINT, headers={"Authorization": "Bearer " + config["api_key"]}, json=payload)

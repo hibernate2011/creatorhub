@@ -33,7 +33,7 @@
 
 ### 评论 AI 潜客分析
 
-在「评论监控 → AI 潜客分析配置」填写 OpenRouter API Key，可开启抓取后自动分析；历史评论在「评论记录」中勾选后点击「分析所选」。使用 [Gemini Decision 1](https://openrouter.ai/google/gemini-decision-1) 的 [Decisions API](https://openrouter.ai/docs/guides/community/multimodal-decisions)，同平台、同作品和同提示词版本的评论合并请求。每条 Question 包含作品标题、用户昵称和评论内容，昵称用于辅助判断行业与需求的匹配度。列表可按分析状态和潜客置信度筛选，当前结果导出遵循相同筛选。
+在「评论监控 → AI 潜客分析配置」填写 OpenRouter API Key，可开启抓取后自动分析；历史评论在「评论记录」中勾选后点击「分析所选」。使用 [Gemini Decision 1](https://openrouter.ai/google/gemini-decision-1) 的 [Decisions API](https://openrouter.ai/docs/guides/community/multimodal-decisions)，使用同一提示词版本和排除规则的评论可以跨作品、跨平台合并请求。每条 Question 包含平台、作品标题、用户昵称和评论内容，昵称用于辅助判断行业与需求的匹配度。列表可按分析状态和潜客置信度筛选，当前结果导出遵循相同筛选。
 
 - 内置默认提示词，可添加行业规则并关联一个或多个账号/作品监控、作品 ID 或监控分组。匹配优先级为作品 ID → 监控任务 → 分组 → 默认；同级按列表顺序。修改规则自动递增版本，已入队的评论保留提示词快照。
 - 以平台、作品 ID、评论 ID 去重，跨监控任务复用结果；同一评论以首次入队时的规则为准。成功结果不会因修改提示词、重复抓取或删除后重新抓取而重新分析。

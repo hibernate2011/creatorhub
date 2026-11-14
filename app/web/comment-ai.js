@@ -170,7 +170,7 @@ async function openCommentAISettings() {
       ${commentAIField('OpenRouter API Key', `<input id="cai-key" type="password" autocomplete="new-password" value="${esc(config.api_key)}">`)}
       <label style="display:block;margin:10px 0"><input id="cai-auto" type="checkbox" ${config.auto_analyze ? 'checked' : ''}>抓取新评论后自动分析</label>
       <label style="display:block;margin:10px 0"><input id="cai-forward" type="checkbox" ${config.auto_forward ? 'checked' : ''}>分析完成后按各目标阈值自动转发</label>
-      ${commentAIField('同作品每批最多评论数（1–500）', `<input id="cai-batch" type="number" min="1" max="500" value="${config.batch_size}">`)}
+      ${commentAIField('同一提示词每批最多评论数（1–500）', `<input id="cai-batch" type="number" min="1" max="500" value="${config.batch_size}">`)}
       <p class="mut">提示词匹配顺序：作品 ID → 指定监控任务 → 分组 → 默认。同级规则优先使用列表中靠前的规则。修改会创建新版本，仅影响之后入队的评论。</p>
       <div id="cai-prompts"></div><button class="ghost sm wb-secondary-action" type="button" onclick="commentAIAddPrompt()">${ic("i-plus")}添加领域提示词</button>
       <p class="mut">每个群机器人可单独设置阈值。已成功转发的评论不会重复发送到同一目标。******** 表示保留已配置的密钥，清空字段会删除该值。</p>
