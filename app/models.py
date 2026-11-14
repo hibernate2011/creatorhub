@@ -416,6 +416,7 @@ class CommentAnalysis(SQLModel, table=True):
     user_nickname: str = ""
     user_sec_uid: str = ""
     user_profile_url: str = ""
+    ip_label: str = ""
     work_title: str = ""
     prompt_id: str = "default"
     prompt_name: str = ""

@@ -329,11 +329,15 @@ def enqueue(session, rows, *, automatic=False):
         policy = watch_policy(watch)
         key = analysis_id(row)
         existing = session.get(CommentAnalysis, key) if row.comment_id else None
-        if existing and not existing.comment_create_time and row.create_time:
-            existing.comment_create_time = row.create_time
-        if existing and automatic and auto_enabled(config, policy, "auto_forward"):
-            queue_deliveries(session, existing, watch_destinations(config, watch, policy),
-                             watch_id=row.watch_id or 0, automatic=True)
+        region = (row.ip_label or "").strip()
+        if existing:
+            if not existing.comment_create_time and row.create_time:
+                existing.comment_create_time = row.create_time
+            if not existing.ip_label and region:
+                existing.ip_label = region
+            if automatic and auto_enabled(config, policy, "auto_forward"):
+                queue_deliveries(session, existing, watch_destinations(config, watch, policy),
+                                 watch_id=row.watch_id or 0, automatic=True)
         if not row.comment_id or existing:
             counts["skipped"] += 1
             continue
@@ -350,7 +354,7 @@ def enqueue(session, rows, *, automatic=False):
             comment_id=row.comment_id, watch_id=row.watch_id or 0, text=row.text,
             comment_create_time=row.create_time or 0,
             user_nickname=row.user_nickname, user_sec_uid=row.user_sec_uid,
-            user_profile_url=row.user_profile_url,
+            user_profile_url=row.user_profile_url, ip_label=region,
             work_title=title, prompt_id=prompt["id"], prompt_name=prompt["name"],
             prompt_version=prompt["version"], prompt=prompt["text"],
             exclude_keywords=json.dumps(prompt["exclude_keywords"], ensure_ascii=False))
@@ -618,8 +622,10 @@ def lead_text(row, watch: CommentWatch | None = None):
         group_tags = " / ".join(filter(None, (watch.group_name, tags)))
         if group_tags:
             lines.append(f"分组标签：{group_tags}")
-    lines.extend([f"用户：{row.user_nickname[:100]}",
-                  f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"])
+    lines.append(f"用户：{row.user_nickname[:100]}")
+    if row.ip_label:
+        lines.append(f"用户地区：{row.ip_label}")
+    lines.extend([f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"])
     if row.platform in work_urls and row.aweme_id:
         lines.append(f"作品链接：{work_urls[row.platform]}{quote(row.aweme_id, safe='')}")
     profile = row.user_profile_url
@@ -630,6 +636,26 @@ def lead_text(row, watch: CommentWatch | None = None):
     elif row.user_sec_uid:
         lines.append(f"用户 ID：{row.user_sec_uid}")
     return "\n".join(lines)
+
+
+def _fill_missing_comment_metadata(session, analysis):
+    source_match = (
+        CommentRecord.platform == analysis.platform,
+        CommentRecord.aweme_id == analysis.aweme_id,
+        CommentRecord.comment_id == analysis.comment_id,
+    )
+    if not analysis.comment_create_time:
+        timestamp = session.exec(select(CommentRecord.create_time).where(
+            *source_match, CommentRecord.create_time > 0,
+        ).order_by(CommentRecord.id)).first()
+        if timestamp:
+            analysis.comment_create_time = timestamp
+    if not analysis.ip_label:
+        region = session.exec(select(CommentRecord.ip_label).where(
+            *source_match, CommentRecord.ip_label != "",
+        ).order_by(CommentRecord.id)).first()
+        if region:
+            analysis.ip_label = region.strip()
 
 
 async def process_delivery():
@@ -654,15 +680,7 @@ async def process_delivery():
             if robot is None or webhook_ready(session, robot):
                 break
             cooling.add(row.destination_id)
-        if not analysis.comment_create_time:
-            timestamp = session.exec(select(CommentRecord.create_time).where(
-                CommentRecord.platform == analysis.platform,
-                CommentRecord.aweme_id == analysis.aweme_id,
-                CommentRecord.comment_id == analysis.comment_id,
-                CommentRecord.create_time > 0,
-            ).order_by(CommentRecord.id)).first()
-            if timestamp:
-                analysis.comment_create_time = timestamp
+        _fill_missing_comment_metadata(session, analysis)
         key, text = row.id, lead_text(analysis, watch)
         claimed = session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == key,
             CommentLeadDelivery.status == "pending").values(status="sending", attempts=CommentLeadDelivery.attempts + 1,

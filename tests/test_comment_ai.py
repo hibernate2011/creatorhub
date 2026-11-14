@@ -41,10 +41,11 @@ class CommentAITests(unittest.TestCase):
         return ai.save_settings(ai.SettingsIn(**self.config))
 
     def add(self, comment_id="c1", work="w1", platform="douyin", watch_id=0, title="装修服务", enqueue=True,
-            *, text="多少钱？想预约", nickname="客户"):
+            *, text="多少钱？想预约", nickname="客户", ip_label=""):
         with db.get_session() as session:
             row = CommentRecord(comment_id=comment_id, aweme_id=work, platform=platform,
-                                watch_id=watch_id, work_title=title, text=text, user_nickname=nickname)
+                                watch_id=watch_id, work_title=title, text=text,
+                                user_nickname=nickname, ip_label=ip_label)
             session.add(row)
             if enqueue:
                 ai.enqueue(session, [row], automatic=True)
@@ -345,6 +346,7 @@ class CommentAITests(unittest.TestCase):
         self.assertNotIn("private-comment", text)
         self.assertNotIn("internal-prompt", text)
         self.assertNotIn("用户 ID：", text)
+        self.assertNotIn("用户地区：", text)
         row.platform = "tiktok"
         row.user_profile_url = "https://www.tiktok.com/@customer"
         self.assertIn("用户主页：https://www.tiktok.com/@customer", ai.lead_text(row))
@@ -354,20 +356,25 @@ class CommentAITests(unittest.TestCase):
         row.user_sec_uid = ""
         self.assertNotIn("用户 ID：", ai.lead_text(row))
 
-    def test_delivery_comment_time_for_existing_and_deleted_records(self):
+    def test_delivery_metadata_for_existing_and_deleted_records(self):
         row_id, key = self.add()
         with db.get_session() as session:
-            session.get(CommentRecord, row_id).create_time = 1700000000
+            source = session.get(CommentRecord, row_id)
+            source.create_time = 1700000000
+            source.ip_label = "北京"
             session.commit()
         self.analyze_all()
         with patch.object(ai, "send_one", AsyncMock(return_value=(False, "failure"))) as send:
             asyncio.run(ai.process_delivery())
             self.assertIn("评论：多少钱？想预约\n评论时间：2023-11-15 06:13:20", send.call_args.args[3])
+            self.assertIn("用户地区：北京", send.call_args.args[3].splitlines())
         with db.get_session() as session:
             self.assertEqual(session.get(CommentAnalysis, key).comment_create_time, 1700000000)
             session.delete(session.get(CommentRecord, row_id))
             session.commit()
-            self.assertIn("评论时间：2023-11-15 06:13:20", ai.lead_text(session.get(CommentAnalysis, key)))
+            message = ai.lead_text(session.get(CommentAnalysis, key))
+            self.assertIn("评论时间：2023-11-15 06:13:20", message)
+            self.assertIn("用户地区：北京", message.splitlines())
 
     def test_comment_parsers_capture_profile_identifiers(self):
         from app.platforms.xhs.extract import parse_comment as parse_xhs
@@ -674,12 +681,14 @@ class CommentAITests(unittest.TestCase):
             connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN excluded_keyword"))
             connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN excluded_by_model"))
             connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN exclude_keywords"))
+            connection.execute(text("ALTER TABLE commentanalysis DROP COLUMN ip_label"))
         db._engine.dispose()
         db.init_db(str(Path(self.tmp.name) / "test.db"))
         self.assertIn("work_title", {c["name"] for c in inspect(db._engine).get_columns("commentrecord")})
         with db.get_session() as session:
             analysis = session.get(CommentAnalysis, key)
             self.assertEqual((analysis.confidence, analysis.exclude_keywords, analysis.is_excluded), (.81, "[]", False))
+            self.assertEqual(analysis.ip_label, "")
         with db.get_session() as session:
             row = session.get(CommentRecord, row_id)
             self.assertEqual(row.text, "多少钱？想预约")
@@ -832,9 +841,9 @@ class CommentAITests(unittest.TestCase):
         self.add(watch_id=inherited, comment_id="global")
         self.add(watch_id=first)
         self.analyze_all()
-        self.add(watch_id=second)
+        self.add(watch_id=second, ip_label="上海")
         with db.get_session() as session:
-            self.assertEqual(len(session.exec(select(CommentAnalysis)).all()), 1)
+            self.assertEqual(session.exec(select(CommentAnalysis)).one().ip_label, "上海")
             self.assertEqual({row.destination_id for row in session.exec(select(CommentLeadDelivery))},
                              {f"watch:{first}:sales", f"watch:{second}:sales"})
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
@@ -859,13 +868,14 @@ class CommentAITests(unittest.TestCase):
             session.add(watch)
             session.commit()
             watch_id = watch.id
-        row_id, key = self.add(watch_id=watch_id)
+        row_id, key = self.add(watch_id=watch_id, ip_label=" 广东 ")
         self.analyze_all()
         self.assertEqual(asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id])))["queued"], 1)
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             self.assertTrue(asyncio.run(ai.process_delivery()))
             self.assertEqual(send.await_args.args[1]["name"], "门店群")
             self.assertIn("分组标签：新客、预约", send.await_args.args[3].splitlines())
+            self.assertIn("用户地区：广东", send.await_args.args[3].splitlines())
         with db.get_session() as session:
             self.assertEqual(session.get(CommentLeadDelivery, f"{key}:watch:{watch_id}:branch").status, "sent")
 
