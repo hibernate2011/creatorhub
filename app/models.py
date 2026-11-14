@@ -452,6 +452,13 @@ class CommentLeadDelivery(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class WebhookSendState(SQLModel, table=True):
+    """Shared request pacing and cooldown for one robot endpoint."""
+    robot_key: str = Field(primary_key=True)
+    available_at: float = 0.0
+    lease_until: float = 0.0
+
+
 class KeywordCollectionJob(SQLModel, table=True):
     """一次性的关键词批量采集任务。与持续轮询的 MonitorTarget 分开建模。"""
     id: Optional[int] = Field(default=None, primary_key=True)

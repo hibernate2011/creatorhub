@@ -20,20 +20,22 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import and_, case, update
 from sqlalchemy.dialects.sqlite import insert
-from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from .db import get_session
 from .models import (AppSetting, CommentAnalysis, CommentLeadDelivery,
                      CommentRecord, CommentWatch, ContentRecord, AccountWork)
+from .monitor_metadata import load_tags
 from .notification_config import MASK, redact_detail
 from .notifier import send_one
+from .notifier.rate_limit import WebhookBusy, WebhookRateLimited, robot_key, webhook_ready
 
 log = logging.getLogger(__name__)
 MODEL = "google/gemini-decision-1"
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 SETTING = "comment_ai_pipeline"
 MAX_NICKNAME_LENGTH = 256
+MAX_DELIVERY_ATTEMPTS = 3
 DouyinTitleLoader = Callable[[str, int, str], Awaitable[str]]
 LEGACY_DEFAULT_PROMPT = """判断指定评论的作者是否可能成为作品所涉及产品或服务的潜在客户。
 明确询价、询问购买渠道、预约、试用、合作采购、说明自身需求或问题并寻求解决方案，是积极信号。
@@ -597,7 +599,7 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
     return True
 
 
-def lead_text(row):
+def lead_text(row, watch: CommentWatch | None = None):
     work_urls = {"douyin": "https://www.douyin.com/video/", "xhs": "https://www.xiaohongshu.com/explore/",
                  "kuaishou": "https://www.kuaishou.com/short-video/"}
     profile_urls = {"douyin": "https://www.douyin.com/user/", "xhs": "https://www.xiaohongshu.com/user/profile/",
@@ -610,9 +612,14 @@ def lead_text(row):
             ).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         pass
-    lines = [f"潜客置信度：{row.confidence:.1%}", f"平台：{row.platform}",
-             f"用户：{row.user_nickname[:100]}",
-             f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"]
+    lines = [f"潜客置信度：{row.confidence:.1%}", f"平台：{row.platform}"]
+    if watch:
+        tags = "、".join(load_tags(watch.tags))
+        group_tags = " / ".join(filter(None, (watch.group_name, tags)))
+        if group_tags:
+            lines.append(f"分组标签：{group_tags}")
+    lines.extend([f"用户：{row.user_nickname[:100]}",
+                  f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"])
     if row.platform in work_urls and row.aweme_id:
         lines.append(f"作品链接：{work_urls[row.platform]}{quote(row.aweme_id, safe='')}")
     profile = row.user_profile_url
@@ -627,26 +634,26 @@ def lead_text(row):
 
 async def process_delivery():
     with get_session() as session:
-        # Pace each destination below DingTalk's 20/minute ceiling. The durable
-        # timestamps survive a restart; other destinations can still drain.
-        recent = aliased(CommentLeadDelivery)
-        cooling = select(recent.id).where(
-            recent.destination_id == CommentLeadDelivery.destination_id,
-            recent.status.in_(["sending", "sent", "failed"]),
-            recent.updated_at > datetime.utcnow() - timedelta(seconds=3.1)).exists()
-        row = session.exec(select(CommentLeadDelivery).where(CommentLeadDelivery.status == "pending", ~cooling)
-                           .order_by(CommentLeadDelivery.created_at).limit(1)).first()
-        if not row:
-            return False
         config = settings(session)
-        analysis = session.get(CommentAnalysis, row.analysis_id)
-        dest = delivery_destination(session, config, row, analysis) if analysis else None
-        if not dest or analysis.is_excluded or analysis.confidence is None or analysis.confidence < dest["threshold"]:
-            error = "命中排除规则" if analysis and analysis.is_excluded else "推送已关闭、渠道已变更或未达到当前阈值"
-            session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == row.id,
-                CommentLeadDelivery.status == "pending").values(status="skipped", error=error))
-            session.commit()
-            return True
+        cooling = set()
+        pending = select(CommentLeadDelivery).where(CommentLeadDelivery.status == "pending").order_by(
+            CommentLeadDelivery.created_at, CommentLeadDelivery.id).limit(1)
+        while True:
+            row = session.exec(pending.where(CommentLeadDelivery.destination_id.not_in(cooling))).first()
+            if not row:
+                return False
+            analysis = session.get(CommentAnalysis, row.analysis_id)
+            dest, watch = delivery_destination(session, config, row, analysis) if analysis else (None, None)
+            if not dest or analysis.is_excluded or analysis.confidence is None or analysis.confidence < dest["threshold"]:
+                error = "命中排除规则" if analysis and analysis.is_excluded else "推送已关闭、渠道已变更或未达到当前阈值"
+                session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == row.id,
+                    CommentLeadDelivery.status == "pending").values(status="skipped", error=error))
+                session.commit()
+                return True
+            robot = robot_key(dest["type"], dest["webhook"])
+            if robot is None or webhook_ready(session, robot):
+                break
+            cooling.add(row.destination_id)
         if not analysis.comment_create_time:
             timestamp = session.exec(select(CommentRecord.create_time).where(
                 CommentRecord.platform == analysis.platform,
@@ -656,14 +663,27 @@ async def process_delivery():
             ).order_by(CommentRecord.id)).first()
             if timestamp:
                 analysis.comment_create_time = timestamp
-        key, text = row.id, lead_text(analysis)
+        key, text = row.id, lead_text(analysis, watch)
         claimed = session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == key,
-            CommentLeadDelivery.status == "pending", ~cooling).values(status="sending", attempts=CommentLeadDelivery.attempts + 1,
+            CommentLeadDelivery.status == "pending").values(status="sending", attempts=CommentLeadDelivery.attempts + 1,
                                                            updated_at=datetime.utcnow()))
         session.commit()
         if not claimed.rowcount:
             return True
-    ok, detail = await send_one(dest["type"], dest, "评论潜在客户线索", text)
+    try:
+        ok, detail = await send_one(dest["type"], dest, "评论潜在客户线索", text, defer_if_limited=True)
+    except (WebhookBusy, WebhookRateLimited) as exc:
+        with get_session() as session:
+            row = session.get(CommentLeadDelivery, key)
+            if isinstance(exc, WebhookBusy):
+                row.attempts -= 1
+                row.status = "pending"
+            else:
+                row.status = "pending" if row.attempts < MAX_DELIVERY_ATTEMPTS else "failed"
+                row.error = str(exc)
+            row.updated_at = datetime.utcnow()
+            session.commit()
+        return True
     with get_session() as session:
         row = session.get(CommentLeadDelivery, key)
         row.status = "sent" if ok else "failed"
@@ -695,8 +715,8 @@ def delivery_destination(session, config, delivery, analysis):
             continue
         for dest in watch_destinations(config, watch, policy):
             if dest["id"] == delivery.destination_id and dest["enabled"]:
-                return dest
-    return None
+                return dest, watch
+    return None, None
 
 
 def recover_stale():
@@ -779,6 +799,24 @@ async def analyze(body: AnalysisSelectionIn):
             counts["refreshed"] = session.execute(update(CommentAnalysis).where(
                 CommentAnalysis.id.in_(missing), CommentAnalysis.status == "done"
             ).values(status="queued", error="", updated_at=datetime.utcnow())).rowcount
+        session.commit()
+        return counts
+
+
+@router.post("/analyze-all", status_code=202)
+def analyze_all():
+    with get_session() as session:
+        pending = filter_analysis(select(CommentRecord), status="unanalyzed").where(CommentRecord.comment_id != "")
+        counts = {"queued": 0, "skipped": 0}
+        last_id = 0
+        while True:
+            rows = session.exec(pending.where(CommentRecord.id > last_id).order_by(CommentRecord.id).limit(500)).all()
+            if not rows:
+                break
+            added = enqueue(session, rows)
+            counts["queued"] += added["queued"]
+            counts["skipped"] += added["skipped"]
+            last_id = rows[-1].id
         session.commit()
         return counts
 

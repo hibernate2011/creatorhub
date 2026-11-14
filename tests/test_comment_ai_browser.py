@@ -66,6 +66,11 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     dialog.get_by_role("button", name="取消", exact=True).click()
     page.get_by_role("tab", name="评论记录", exact=True).click()
     records = page.locator("#comment-table")
+    expect(page.get_by_role("button", name="分析所选", exact=True)).to_be_disabled()
+    page.get_by_role("button", name="分析所有记录", exact=True).click()
+    expect(page.get_by_text("已将所有平台的 1250 条未分析评论加入队列")).to_be_visible()
+    all_request = json.loads(page.locator('html').get_attribute('data-fixture-ai-requests'))[-1]
+    assert all_request == {"path": "/api/comment-ai/analyze-all", "search": "", "body": None}
     records.locator('input[type="checkbox"]').first.check()
     page.get_by_role("button", name="分析所选", exact=True).click()
     expect(records).to_contain_text("潜客置信度 91.0%")

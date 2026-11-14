@@ -14,7 +14,8 @@ from sqlmodel import select
 import app.db as db
 from app import comment_ai as ai
 from app.models import (AppSetting, CommentAnalysis, CommentLeadDelivery, CommentRecord,
-                        CommentWatch, ContentRecord, AccountWork)
+                        CommentWatch, ContentRecord, AccountWork, WebhookSendState)
+from app.notifier import rate_limit, send_one
 
 
 class CommentAITests(unittest.TestCase):
@@ -630,6 +631,40 @@ class CommentAITests(unittest.TestCase):
                 self.assertEqual((await client.get("/api/comments?min_confidence=2")).status_code, 422)
         asyncio.run(run())
 
+    def test_analyze_all_queues_unanalyzed_comments_across_pages_and_platforms(self):
+        from app.main import app
+
+        self.config["auto_analyze"] = False
+        self.save()
+        with db.get_session() as session:
+            comments = [CommentRecord(comment_id=str(i), aweme_id="work", work_title="作品标题",
+                                      platform="xhs" if i % 2 else "douyin", watch_id=21 + i % 2)
+                        for i in range(1005)]
+            session.add_all(comments)
+            session.add(CommentRecord(comment_id="0", aweme_id="work", watch_id=23))
+            session.add(CommentRecord(comment_id="", aweme_id="work"))
+            for index, status in enumerate(("queued", "processing", "done", "failed")):
+                source = comments[index]
+                session.add(CommentAnalysis(id=ai.analysis_id(source), platform=source.platform,
+                                            aweme_id=source.aweme_id, comment_id=source.comment_id, status=status))
+            session.commit()
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+                result = await client.post("/api/comment-ai/analyze-all")
+                self.assertEqual(result.status_code, 202)
+                self.assertEqual(result.json(), {"queued": 1001, "skipped": 0})
+                again = await client.post("/api/comment-ai/analyze-all")
+                self.assertEqual(again.json(), {"queued": 0, "skipped": 0})
+
+        asyncio.run(run())
+        with db.get_session() as session:
+            rows = session.exec(select(CommentAnalysis)).all()
+            self.assertEqual(len(rows), 1005)
+            self.assertEqual({row.platform for row in rows if row.status == "queued"}, {"douyin", "xhs"})
+            self.assertEqual({row.comment_id: row.status for row in rows if row.status != "queued"},
+                             {"1": "processing", "2": "done", "3": "failed"})
+
     def test_existing_database_migration_preserves_comment(self):
         from sqlalchemy import text, inspect
         row_id, key = self.add()
@@ -670,28 +705,118 @@ class CommentAITests(unittest.TestCase):
             asyncio.run(export_comments_report(min_confidence=.8, full=True))
             self.assertEqual(len(report.call_args.args[0]), 2)
 
-    def test_bulk_delivery_is_paced_per_destination(self):
-        self.add("one")
-        self.add("two")
+    def test_bulk_delivery_shares_robot_pacing_with_other_channels(self):
+        robot = self.config["destinations"][0]
+        other = {**robot, "id": "other", "webhook": robot["webhook"] + "-other"}
+        self.config["destinations"].append(other)
+        self.save()
+        with db.get_session() as session:
+            alias = {**robot, "webhook": robot["webhook"] + "?source=comments"}
+            policy = ai.WatchAISettings(destination_mode="custom", destinations=[alias])
+            watch = CommentWatch(ai_policy=policy.model_dump_json())
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        _, global_key = self.add("one")
+        _, custom_key = self.add("two", watch_id=watch_id)
         self.analyze_all()
-        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+        sent = []
+
+        def handler(request):
+            sent.append(str(request.url))
+            return httpx.Response(200, json={"code": 0})
+
+        with self.client(handler), patch.object(rate_limit, "time", return_value=1000) as clock:
+            self.assertTrue(asyncio.run(send_one("feishu", robot, "测试通知", "测试"))[0])
             self.assertTrue(asyncio.run(ai.process_delivery()))
             self.assertFalse(asyncio.run(ai.process_delivery()))
-            self.assertEqual(send.await_count, 1)
-            with db.get_session() as session:
-                sent = session.exec(select(CommentLeadDelivery).where(CommentLeadDelivery.status == "sent")).one()
-                sent.updated_at = datetime.utcnow() - timedelta(seconds=4)
-                session.add(sent)
-                session.commit()
+            self.assertEqual(sent, [robot["webhook"], other["webhook"]])
+
+            db._engine.dispose()
+            db.init_db(str(Path(self.tmp.name) / "test.db"))
+            clock.return_value = 1000.64
+            self.assertFalse(asyncio.run(ai.process_delivery()))
+            clock.return_value = 1000.65
             self.assertTrue(asyncio.run(ai.process_delivery()))
-            self.assertEqual(send.await_count, 2)
+            self.assertFalse(asyncio.run(ai.process_delivery()))
+            clock.return_value = 1001.31
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+        self.assertEqual(sent, [robot["webhook"], other["webhook"], robot["webhook"], alias["webhook"]])
+        with db.get_session() as session:
+            for delivery_id in (f"{global_key}:sales", f"{custom_key}:watch:{watch_id}:sales"):
+                self.assertEqual(session.get(CommentLeadDelivery, delivery_id).attempts, 1)
+
+    def test_provider_throttle_defers_comments_and_honors_shared_cooldown(self):
+        for kind, webhook, code, status, retry_after, cooldown in (
+            ("dingtalk", "https://oapi.dingtalk.com/robot/send?access_token=ding", {"errcode": 130101}, 200, "30", 600),
+            ("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/limited", {"code": 11232}, 200, "", 60),
+            ("feishu", "https://open.feishu.cn/open-apis/bot/v2/hook/http429", {}, 429, "90", 90),
+        ):
+            with self.subTest(webhook=webhook):
+                robot = {**self.config["destinations"][0], "type": kind, "webhook": webhook}
+                self.config["destinations"] = [robot]
+                self.save()
+                _, key = self.add(webhook)
+                self.analyze_all()
+                responses = iter([
+                    httpx.Response(status, json=code, headers={"Retry-After": retry_after}),
+                    httpx.Response(200, json={"code": 0, "errcode": 0}),
+                ])
+                with self.client(lambda request: next(responses)), patch.object(rate_limit, "time", return_value=1000) as clock:
+                    self.assertTrue(asyncio.run(ai.process_delivery()))
+                    with db.get_session() as session:
+                        delivery = session.get(CommentLeadDelivery, f"{key}:sales")
+                        self.assertEqual((delivery.status, delivery.attempts), ("pending", 1))
+                        state = session.get(WebhookSendState, rate_limit.robot_key(kind, webhook))
+                        self.assertEqual(state.available_at, 1000 + cooldown)
+                    clock.return_value = 1000 + cooldown - 0.1
+                    self.assertFalse(asyncio.run(ai.process_delivery()))
+                    clock.return_value = 1000 + cooldown
+                    self.assertTrue(asyncio.run(ai.process_delivery()))
+                with db.get_session() as session:
+                    delivery = session.get(CommentLeadDelivery, f"{key}:sales")
+                    self.assertEqual((delivery.status, delivery.attempts), ("sent", 2))
+
+    def test_dingtalk_concurrent_sends_share_token_and_hold_minimum_interval(self):
+        first = "https://oapi.dingtalk.com/robot/send?access_token=robot-1"
+        same_robot = "https://OAPI.DINGTALK.COM:443/robot/send?source=monitor&access_token=robot%2D1"
+        requests = []
+
+        async def run(clock):
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def handler(request):
+                requests.append(request)
+                started.set()
+                await release.wait()
+                return httpx.Response(200, json={"errcode": 0})
+
+            with self.client(handler):
+                pending = asyncio.create_task(send_one("dingtalk", {"webhook": first}, "测试", "一"))
+                await started.wait()
+                with self.assertRaises(rate_limit.WebhookBusy):
+                    await send_one("dingtalk", {"webhook": same_robot}, "测试", "二", defer_if_limited=True)
+                release.set()
+                self.assertTrue((await pending)[0])
+                clock.return_value = 1003.09
+                with self.assertRaises(rate_limit.WebhookBusy):
+                    await send_one("dingtalk", {"webhook": same_robot}, "测试", "二", defer_if_limited=True)
+                clock.return_value = 1003.1
+                self.assertTrue((await send_one("dingtalk", {"webhook": same_robot}, "测试", "二",
+                                                defer_if_limited=True))[0])
+
+        with patch.object(rate_limit, "time", return_value=1000) as clock:
+            asyncio.run(run(clock))
+        self.assertEqual(len(requests), 2)
 
     def test_watch_override_uses_custom_channel_and_reuses_analysis_across_watches(self):
         from app.main import WatchUpdate, update_watch
         self.config.update(auto_analyze=False, auto_forward=False)
         self.save()
         with db.get_session() as session:
-            watches = [CommentWatch(title=name) for name in ("全局", "门店一", "门店二")]
+            watches = [CommentWatch(title=name, group_name=name, tags='["销售","线索"]')
+                       for name in ("全局", "门店一", "门店二")]
             session.add_all(watches)
             session.commit()
             inherited, first, second = [w.id for w in watches]
@@ -715,15 +840,18 @@ class CommentAITests(unittest.TestCase):
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             self.assertTrue(asyncio.run(ai.process_delivery()))
             self.assertTrue(asyncio.run(ai.process_delivery()))
-            self.assertEqual({call.args[1]["webhook"].rsplit("/", 1)[-1] for call in send.call_args_list},
-                             {f"branch-{first}", f"branch-{second}"})
+            sent_texts = {call.args[1]["webhook"].rsplit("/", 1)[-1]: call.args[3]
+                          for call in send.call_args_list}
+            self.assertEqual(set(sent_texts), {f"branch-{first}", f"branch-{second}"})
+            self.assertIn("分组标签：门店一 / 销售、线索", sent_texts[f"branch-{first}"].splitlines())
+            self.assertIn("分组标签：门店二 / 销售、线索", sent_texts[f"branch-{second}"].splitlines())
 
     def test_manual_forward_uses_target_channel_when_global_channels_are_empty(self):
         self.config["destinations"] = []
         self.config["auto_forward"] = False
         self.save()
         with db.get_session() as session:
-            watch = CommentWatch()
+            watch = CommentWatch(tags="新客，预约")
             ai.save_watch_policy(session, watch, ai.WatchAISettings(
                 destination_mode="custom", destinations=[ai.DestinationIn(
                     id="branch", name="门店群", type="feishu",
@@ -737,6 +865,7 @@ class CommentAITests(unittest.TestCase):
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             self.assertTrue(asyncio.run(ai.process_delivery()))
             self.assertEqual(send.await_args.args[1]["name"], "门店群")
+            self.assertIn("分组标签：新客、预约", send.await_args.args[3].splitlines())
         with db.get_session() as session:
             self.assertEqual(session.get(CommentLeadDelivery, f"{key}:watch:{watch_id}:branch").status, "sent")
 

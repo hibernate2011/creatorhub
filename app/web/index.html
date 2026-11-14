@@ -3425,6 +3425,7 @@
     </div>
     <div role="group" aria-label="评论批量操作与 AI 配置" style="display:flex;flex-wrap:wrap;gap:8px;margin:12px 0">
       <button type="button" class="sm" id="comment-analyze" disabled onclick="commentAIAction('analyze')"><svg aria-hidden="true"><use href="#i-bolt"/></svg>分析所选</button>
+      <button type="button" class="sm" onclick="commentAIAnalyzeAll(this)" aria-label="分析所有记录" title="将所有平台的未分析评论加入队列，包含当前筛选范围以外的记录"><svg aria-hidden="true"><use href="#i-bolt"/></svg>分析所有记录</button>
       <button type="button" class="ghost sm wb-secondary-action" id="comment-forward" disabled onclick="commentAIAction('forward')"><svg aria-hidden="true"><use href="#i-send"/></svg>按阈值转发所选</button>
       <button type="button" class="ghost sm wb-secondary-action" onclick="openCommentAISettings()"><svg aria-hidden="true"><use href="#i-settings"/></svg>AI 配置</button>
       <span id="comment-selcount" class="comment-selection-count" role="status" aria-live="polite"></span>

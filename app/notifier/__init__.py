@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -17,7 +18,23 @@ from typing import Dict, List, Tuple
 
 import httpx
 
+from .rate_limit import (WEBHOOK_INTERVAL, WEBHOOK_RATE_CODE, WebhookBusy, WebhookRateLimited,
+                         finish_webhook, reserve_webhook, robot_key)
+
 TIMEOUT = 12.0
+
+
+def _webhook_result(response: httpx.Response, kind: str) -> Tuple[bool, str]:
+    try:
+        result = response.json()
+    except ValueError:
+        result = None
+    code = None
+    if isinstance(result, dict):
+        code = result.get("errcode") if kind == "dingtalk" else result.get("code", result.get("StatusCode"))
+    if response.status_code == 429 or code == WEBHOOK_RATE_CODE[kind]:
+        raise WebhookRateLimited(kind, response.headers.get("Retry-After", ""))
+    return response.is_success and code == 0, response.text[:120]
 
 
 async def _send_bark(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
@@ -45,11 +62,7 @@ async def _send_dingtalk(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
     content = f"{keyword} {title}\n{text}".strip()
     async with httpx.AsyncClient(timeout=TIMEOUT) as c:
         r = await c.post(webhook, json={"msgtype": "text", "text": {"content": content}})
-        try:
-            ok = r.is_success and r.json().get("errcode", -1) == 0
-        except Exception:
-            ok = False
-        return ok, r.text[:120]
+        return _webhook_result(r, "dingtalk")
 
 
 async def _send_telegram(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
@@ -77,12 +90,7 @@ async def _send_feishu(cfg: dict, title: str, text: str) -> Tuple[bool, str]:
             f"{timestamp}\n{secret}".encode(), b"", hashlib.sha256).digest()).decode())
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         response = await client.post(webhook, json=payload)
-        try:
-            result = response.json()
-            ok = response.is_success and result.get("code", result.get("StatusCode", -1)) == 0
-        except ValueError:
-            ok = False
-        return ok, response.text[:120]
+        return _webhook_result(response, "feishu")
 
 
 _SENDERS = {"bark": _send_bark, "dingtalk": _send_dingtalk, "telegram": _send_telegram,
@@ -90,12 +98,27 @@ _SENDERS = {"bark": _send_bark, "dingtalk": _send_dingtalk, "telegram": _send_te
 CHANNEL_TYPES = tuple(_SENDERS.keys())
 
 
-async def send_one(ch_type: str, config: dict, title: str, text: str) -> Tuple[bool, str]:
+async def send_one(ch_type: str, config: dict, title: str, text: str, *, defer_if_limited: bool = False) -> Tuple[bool, str]:
     fn = _SENDERS.get(ch_type)
     if not fn:
         return False, f"未知渠道类型: {ch_type}"
     try:
-        return await fn(config, title, text)
+        key = robot_key(ch_type, config.get("webhook") or "")
+        if key is None:
+            return await fn(config, title, text)
+        lease = await reserve_webhook(key, wait_seconds=0 if defer_if_limited else TIMEOUT + 4)
+        delay = WEBHOOK_INTERVAL[ch_type]
+        try:
+            return await asyncio.wait_for(fn(config, title, text), timeout=TIMEOUT)
+        except WebhookRateLimited as exc:
+            delay = exc.cooldown
+            raise
+        finally:
+            finish_webhook(key, lease, delay)
+    except (WebhookBusy, WebhookRateLimited) as exc:
+        if defer_if_limited:
+            raise
+        return False, str(exc)
     except Exception as e:
         return False, repr(e)
 

@@ -36,6 +36,17 @@ async function commentAIAction(action, retry = false, id = null, refreshTitle = 
   } catch (error) { toast(error.message, 'err'); }
 }
 
+async function commentAIAnalyzeAll(button) {
+  try {
+    const result = await withBusy(button, '正在入队', () => api('/api/comment-ai/analyze-all', {method: 'POST'}));
+    toast(result.queued ? `已将所有平台的 ${result.queued} 条未分析评论加入队列` : '没有可分析的新评论', 'ok');
+    await refreshComments();
+    if (result.queued) commentAIPoll();
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
 function commentAIPoll() {
   clearTimeout(COMMENT_AI_POLL);
   let remaining = 60;

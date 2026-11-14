@@ -48,6 +48,10 @@
       body.ids.forEach(id => (url.pathname.endsWith('analyze') ? analyzed : forwarded).add(id));
       return json({queued: body.ids.length, skipped: 0}, 202);
     }
+    if (url.pathname === '/api/comment-ai/analyze-all' && method === 'POST') {
+      record({path: url.pathname, search: url.search, body: init.body || null});
+      return json({queued: 1250, skipped: 0}, 202);
+    }
     const response = await previous(input, init);
     if (url.pathname === '/api/comment-watches' && method === 'GET') {
       const rows = await response.json();
