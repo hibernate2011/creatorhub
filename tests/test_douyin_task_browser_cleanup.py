@@ -1,5 +1,6 @@
 """One-shot browser tasks must not leave the native startup blank window."""
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -188,5 +189,66 @@ def test_pending_api_session_save_finishes_before_browser_is_closed(tmp_path):
         assert await manager.release_task_page(identity, page)
         assert order[0] is False and context.closed
         assert identity.key not in manager._douyin_api_observers
+
+    asyncio.run(run())
+
+
+def test_concurrent_reads_recover_a_shared_disconnected_driver(tmp_path, monkeypatch):
+    manager, identity, _ = environment(tmp_path)
+    identities = [
+        replace(identity, account_id=account_id, profile_dir=str(tmp_path / str(account_id)))
+        for account_id in (13, 14, 15)
+    ]
+
+    async def run():
+        pending = asyncio.Queue()
+        disconnected = asyncio.Event()
+        driver_failure = asyncio.get_running_loop().create_future()
+        old_driver = SimpleNamespace(
+            stop=AsyncMock(),
+            _impl_obj=SimpleNamespace(_connection=SimpleNamespace(
+                _transport=SimpleNamespace(on_error_future=driver_failure))),
+        )
+        new_driver = SimpleNamespace(stop=AsyncMock())
+        start = AsyncMock(side_effect=[old_driver, new_driver])
+        monkeypatch.setattr("app.browser.manager.async_playwright",
+                            lambda: SimpleNamespace(start=start))
+        monkeypatch.setattr(manager, "_detect_chrome_major", AsyncMock(return_value=120))
+
+        class StaleContext(Context):
+            async def new_page(self):
+                pending.put_nowait(None)
+                await disconnected.wait()
+                raise RuntimeError(
+                    "BrowserContext.new_page: Connection closed while reading from the driver")
+
+        stale_contexts = [StaleContext() for _ in identities]
+        manager._launch_persistent = AsyncMock(side_effect=stale_contexts + [Context(), Context()])
+        await manager.start()
+        try:
+            for account in identities:
+                await manager.context_for(account)
+            readers = asyncio.gather(*(manager.new_page(account) for account in identities[:2]))
+            try:
+                for _ in range(2):
+                    await asyncio.wait_for(pending.get(), timeout=2)
+                driver_failure.set_exception(RuntimeError("Connection closed while reading from the driver"))
+                disconnected.set()
+                pages = await asyncio.wait_for(readers, timeout=2)
+            finally:
+                if not readers.done():
+                    readers.cancel()
+                    await asyncio.gather(readers, return_exceptions=True)
+
+            assert start.await_count == 2
+            old_driver.stop.assert_awaited_once()
+            assert manager._cdp_backend.playwright is new_driver
+            assert all(context.closed for context in stale_contexts)
+            assert identities[2].key not in manager._contexts
+            for account, page in zip(identities, pages):
+                assert page.context is manager._contexts[account.key]
+                assert not page.is_closed()
+        finally:
+            await manager.stop()
 
     asyncio.run(run())

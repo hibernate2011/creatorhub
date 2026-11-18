@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -39,6 +40,8 @@ from .cdp import (CdpLaunchError, CdpProfileConflictError, CdpProxyError,
 from .proxy import (HttpProxyAuthRelay, ProxyConfigError, ProxyPlan,
                     try_proxy_plan)
 from .xhs_interaction import XhsInteractionPolicy, XhsVisibleActionGate
+
+log = logging.getLogger(__name__)
 
 _PROXY_WEBRTC_ARGS = [
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -501,10 +504,38 @@ class BrowserManager:
             raise
 
     async def start(self):
-        self._pw = await async_playwright().start()
+        await self._start_driver()
         self._chrome_major = await self._detect_chrome_major()
-        self._cdp_backend = XhsCdpBackend(
-            self._pw, self.profiles_root)
+
+    async def _start_driver(self) -> None:
+        playwright = await async_playwright().start()
+        self._cdp_backend = XhsCdpBackend(playwright, self.profiles_root)
+        self._pw = playwright
+
+    def _driver_error(self) -> BaseException | None:
+        # A driver pipe failure can leave BrowserContext close events and CDP
+        # is_connected() stale. Patchright reports it on the shared transport.
+        impl = getattr(self._pw, "_impl_obj", None)
+        connection = getattr(impl, "_connection", None)
+        transport = getattr(connection, "_transport", None)
+        failure = getattr(transport, "on_error_future", None)
+        if failure is not None and failure.done() and not failure.cancelled():
+            return failure.exception()
+        return getattr(connection, "_closed_error", None)
+
+    async def _recover_driver_unlocked(self) -> None:
+        error = self._driver_error()
+        if error is None:
+            return
+        log.warning("Patchright 驱动已断开，正在重建浏览器连接: %s", error)
+        # Stop the broken connection before cleanup sends commands to it.
+        # Keep the failed driver installed until startup succeeds so a later
+        # scan can retry if startup itself fails.
+        with suppress(Exception):
+            await asyncio.wait_for(self._pw.stop(), timeout=5)
+        for key in list(self._contexts):
+            await self._close_key_unlocked(key)
+        await self._start_driver()
 
     async def _detect_chrome_major(self) -> Optional[int]:
         """选择可用浏览器并探测其 Chromium 大版本。
@@ -1297,6 +1328,7 @@ class BrowserManager:
         """取(或惰性创建)账号专属常驻 context。"""
         key = identity.key
         async with self._cv_lock:
+            await self._recover_driver_unlocked()
             effective_backend = self.effective_browser_backend(identity)
             runtime_id = (
                 self.effective_fingerprint_runtime_id(identity)
@@ -1454,19 +1486,22 @@ class BrowserManager:
 
     async def new_page(self, identity: Identity, block_media: bool = False):
         """从账号常驻 context 开一个新 page(可屏蔽图片/视频/字体)。用完请 page.close()。"""
-        ctx = await self.context_for(identity)
+        ctx = None
         try:
+            ctx = await self.context_for(identity)
             page = await ctx.new_page()
         except Exception as exc:
-            # A user can close the headed Chromium window directly. Patchright
-            # then leaves the now-closed BrowserContext object in our cache for
-            # a short time, so the next click would otherwise fail forever with
-            # TargetClosedError. Evict and relaunch the same account profile
-            # once; login cookies are bridged again by context_for().
             detail = f"{type(exc).__name__}: {exc}".lower()
-            if "targetclosed" not in detail and "has been closed" not in detail:
-                raise
-            await self.close_context(identity.key)
+            driver_lost = (self._driver_error() is not None
+                           or "connection closed while reading from the driver" in detail)
+            if not driver_lost:
+                if ctx is None or ("targetclosed" not in detail
+                                   and "has been closed" not in detail):
+                    raise
+                # A concurrent task may already have replaced this context.
+                async with self._cv_lock:
+                    if self._contexts.get(identity.key) is ctx:
+                        await self._close_key_unlocked(identity.key)
             ctx = await self.context_for(identity)
             page = await ctx.new_page()
         session = self._cdp_sessions.get(identity.key)
