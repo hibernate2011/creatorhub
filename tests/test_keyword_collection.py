@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 from openpyxl import load_workbook
 from fastapi import HTTPException
 from sqlmodel import select
@@ -24,6 +25,7 @@ from app.browser.fetcher import (
     fetch_douyin_search,
 )
 from app.config import Config
+from app.engine import MonitorEngine
 from app.engine.collection import (
     KeywordCollector,
     _sort_ks_search_items,
@@ -46,6 +48,7 @@ from app.main import (
     update_keyword_collection,
 )
 from app.models import (
+    CommentWatch,
     DouyinAccount,
     KeywordCollectionComment,
     KeywordCollectionContent,
@@ -1310,6 +1313,116 @@ class KeywordCollectionMediaPreviewTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as caught:
             asyncio.run(keyword_collection_content_media(self.job_id + 99, content_id))
         self.assertEqual(caught.exception.status_code, 404)
+
+
+class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        previous_engine = db._engine
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        engine = db.init_db(str(Path(temp.name) / "collection-watch.db"))
+        self.addCleanup(setattr, db, "_engine", previous_engine)
+        self.addCleanup(engine.dispose)
+
+    def add_work(self, platform, aweme_id, *, xsec_token="", xsec_source="", source_url=""):
+        with db.get_session() as session:
+            account = DouyinAccount(platform=platform, status="active", storage_state=json.dumps({
+                "cookies": [{"name": "web_session", "value": "fixture"}],
+            }))
+            session.add(account)
+            session.flush()
+            job = KeywordCollectionJob(platform=platform, account_id=account.id)
+            session.add(job)
+            session.flush()
+            work = KeywordCollectionContent(
+                job_id=job.id, platform=platform, aweme_id=aweme_id, desc="采集到的作品标题",
+                xsec_token=xsec_token, xsec_source=xsec_source, source_url=source_url,
+            )
+            session.add(work)
+            session.flush()
+            result = (f"/api/collections/{job.id}/contents/{work.id}/comment-watch", account.id)
+            session.commit()
+            return result
+
+    async def test_create_applies_ai_policy_atomically_and_rejects_duplicate_watch(self):
+        from app.main import app
+
+        work_id = "7461234567890123456"
+        path, account_id = self.add_work("douyin", work_id)
+        destination = {
+            "id": "fixture", "name": "门店群", "type": "feishu", "threshold": 0.85,
+            "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/fixture",
+        }
+        policy = {"auto_forward": "on", "destination_mode": "custom", "destinations": [destination]}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1") as client:
+            failed = await client.post(path, json={"ai_policy": {**policy, "auto_analyze": "on"}})
+            self.assertEqual(failed.status_code, 422)
+            self.assertEqual((await client.get("/api/comment-watches")).json(), [])
+            response = await client.post(path, json={
+                "account_id": account_id, "interval_seconds": 90, "ai_policy": policy,
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            watch = response.json()
+            self.assertEqual((watch["kind"], watch["mode"], watch["aweme_id"]), ("video", "public", work_id))
+            self.assertEqual((watch["account_id"], watch["interval_seconds"]), (account_id, 90))
+            self.assertEqual(watch["title"], "采集到的作品标题")
+            masked = {**destination, "webhook": "********", "secret": "", "keyword": "", "enabled": True}
+            self.assertEqual(watch["ai_policy"], {**policy, "auto_analyze": "inherit", "destinations": [masked]})
+            self.assertEqual((await client.post(path, json={})).status_code, 409)
+            self.assertEqual((await client.post("/api/comment-watches", json={
+                "url_or_id": work_id, "kind": "video",
+            })).status_code, 409)
+            self.assertEqual((await client.get("/api/comment-watches?platform=douyin")).json(), [watch])
+        with db.get_session() as session:
+            saved = session.get(CommentWatch, watch["id"])
+            self.assertEqual(json.loads(saved.ai_policy)["destinations"][0]["webhook"], destination["webhook"])
+
+    async def test_platform_specific_target_and_account_data_are_preserved(self):
+        from app.main import app
+
+        cases = [
+            ("xhs", "652123456789012345678901", "xhs-token", "", ""),
+            ("kuaishou", "3xexample", "", "", ""),
+            ("shipinhao", "1234567890123", "finder-nonce", "", ""),
+            ("tiktok", "7361234567890123456", "", "fixture.creator",
+             "https://www.tiktok.com/@fixture.creator/video/7361234567890123456"),
+        ]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1") as client:
+            for platform, aweme_id, token, author, source_url in cases:
+                with self.subTest(platform=platform):
+                    path, account_id = self.add_work(platform, aweme_id, xsec_token=token, source_url=source_url)
+                    wrong_job_path = f"/api/collections/999/contents/{path.split('/contents/', 1)[1]}"
+                    self.assertEqual((await client.post(wrong_job_path, json={})).status_code, 404)
+                    if platform in {"xhs", "tiktok"}:
+                        self.assertEqual((await client.post(path, json={})).status_code, 400)
+                    response = await client.post(path, json={"account_id": account_id})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    with db.get_session() as session:
+                        watch = session.get(CommentWatch, response.json()["id"])
+                        self.assertEqual((watch.aweme_id, watch.sec_uid, watch.xsec_token), (aweme_id, author, token))
+                        self.assertEqual(watch.account_id, None if platform == "shipinhao" else account_id)
+
+    async def test_xhs_watch_uses_the_collected_token_source_when_scanning(self):
+        from app.main import app
+
+        path, account_id = self.add_work("xhs", "652123456789012345678901", xsec_token="fixture-token",
+                                         xsec_source="pc_user")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1") as client:
+            response = await client.post(path, json={"account_id": account_id})
+            self.assertEqual(response.status_code, 200, response.text)
+        cfg = Config()
+        cfg.engine.xhs_read_mode = "browser"
+        browser = SimpleNamespace(anon_identity=lambda: None, identity_for=lambda _: None,
+                                  visible_page=MagicMock())
+        engine = MonitorEngine(cfg, browser)
+        with patch("app.engine.monitor.fetch_xhs_comments", new=AsyncMock(return_value=([], ""))) as fetch:
+            result = await engine._scan_comment_watch_locked(response.json()["id"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(fetch.await_args.kwargs["xsec_token"], "fixture-token")
+        self.assertEqual(fetch.await_args.kwargs["xsec_source"], "pc_user")
 
 
 class KeywordCollectionCommentQueryTests(unittest.TestCase):

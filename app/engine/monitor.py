@@ -3306,6 +3306,7 @@ class MonitorEngine:
             kind, mode = w.kind, w.mode
             aweme_id, sec_uid = w.aweme_id, w.sec_uid
             xsec_token = w.xsec_token or ""
+            xsec_source = w.xsec_source or ""
             name = w.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
             state = creator_state = proxy = ""
             ua = self.cfg.engine.user_agent
@@ -3389,7 +3390,7 @@ class MonitorEngine:
             elif platform == "xhs":   # 单条笔记
                 total_new, author = await self._cw_xhs_note(
                     watch_id, identity, state, aweme_id,
-                    xsec_token, name, first_scan, proxy)
+                    xsec_token, name, first_scan, proxy, xsec_source=xsec_source)
             elif platform == "kuaishou" and kind == "user":
                 total_new, author = await self._cw_ks_user(watch_id, identity, sec_uid,
                                                            name, first_scan)
@@ -3997,9 +3998,9 @@ class MonitorEngine:
             cookie_str, self._direct_request_ua(identity),
                             timeout=self.cfg.engine.request_timeout_seconds, proxy=proxy)
 
-    async def _xhs_fetch_comments(self, client, note_id, xsec_token, known) -> list:
+    async def _xhs_fetch_comments(self, client, note_id, xsec_token, known, *, xsec_source="") -> list:
         try:
-            d = await client.note_comments(note_id, xsec_token=xsec_token)
+            d = await client.note_comments(note_id, xsec_token=xsec_token, xsec_source=xsec_source)
             raw = d.get("comments") or []
         except XhsApiError:
             raise
@@ -4016,7 +4017,7 @@ class MonitorEngine:
 
     async def _cw_xhs_note(
             self, watch_id, identity, state, note_id, xsec_token, name,
-            first_scan, proxy=""):
+            first_scan, proxy="", *, xsec_source=""):
         work_desc = self._comment_work_title("xhs", note_id)
         metadata = {}
         with get_session() as s:
@@ -4026,7 +4027,7 @@ class MonitorEngine:
         if self._xhs_browser_reads_enabled():
             raw, error = await fetch_xhs_comments(
                 self.browser, identity, note_id, known,
-                xsec_token=xsec_token, xsec_source="pc_feed",
+                xsec_token=xsec_token, xsec_source=xsec_source or "pc_feed",
                 max_scrolls=self._comment_watch_settings(watch_id)["max_scrolls"],
                 block_media=self.cfg.engine.block_media_resources,
                 work_metadata=None if work_desc else metadata)
@@ -4042,10 +4043,11 @@ class MonitorEngine:
             if client is None:
                 return 0, None
             fresh = await self._xhs_fetch_comments(
-                client, note_id, xsec_token, known)
+                client, note_id, xsec_token, known, xsec_source=xsec_source)
             if (fresh or known) and not work_desc:
                 try:
-                    card = await client.note_detail(note_id, xsec_token=xsec_token) or {}
+                    card = await client.note_detail(
+                        note_id, xsec_token=xsec_token, xsec_source=xsec_source or "pc_search") or {}
                     work_desc = card.get("title") or card.get("display_title") or card.get("desc") or ""
                 except Exception as exc:
                     log.debug("评论监控(小红书笔记)读取标题失败 %s: %s", note_id, exc)

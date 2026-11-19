@@ -7502,7 +7502,7 @@ def _validated_collection_input(body: KeywordCollectionIn) \
     if not 0 <= body.min_comments <= 2_000_000_000:
         raise HTTPException(400, "最低评论数须为非负整数")
     if not 0 <= body.max_comments_per_content <= 200:
-        raise HTTPException(400, "每个作品评论数须为 0~200")
+        raise HTTPException(400, "每作品采集评论上限须为 0–200")
     quality = body.video_quality.strip() or "highest"
     if quality not in QUALITY_CHOICES:
         raise HTTPException(400, f"画质取值无效: {quality}")
@@ -9718,6 +9718,12 @@ class WatchIn(BaseModel):
     tags: list[str] = PydanticField(default_factory=list)
 
 
+class CollectionCommentWatchIn(BaseModel):
+    account_id: int | None = None
+    interval_seconds: int = PydanticField(default=600, ge=1, le=86400)
+    ai_policy: WatchAISettings = PydanticField(default_factory=WatchAISettings)
+
+
 class WatchUpdate(BaseModel):
     enabled: bool | None = None
     interval_seconds: int | None = None
@@ -9761,6 +9767,58 @@ async def list_watches(platform: str | None = None):
                              .where(CommentRecord.watch_id.in_([w.id for w in watches]))
                              .group_by(CommentRecord.watch_id)).all()) if watches else {}
         return [dict(_watch_dict(w), comment_count=counts.get(w.id, 0)) for w in watches]
+
+
+def _save_new_comment_watch(session, watch: CommentWatch,
+                            ai_policy: WatchAISettings | None = None) -> dict:
+    query = select(CommentWatch).where(CommentWatch.platform == watch.platform)
+    if watch.kind == "video":
+        query = query.where(CommentWatch.aweme_id == watch.aweme_id)
+    else:
+        query = query.where(CommentWatch.kind != "video", CommentWatch.sec_uid == watch.sec_uid,
+                            CommentWatch.mode == watch.mode)
+    if session.exec(query).first():
+        raise HTTPException(409, "已存在相同的评论监控")
+    if ai_policy is not None:
+        save_watch_policy(session, watch, ai_policy)
+    session.add(watch)
+    session.commit()
+    session.refresh(watch)
+    return _watch_dict(watch)
+
+
+@app.post("/api/collections/{job_id}/contents/{content_id}/comment-watch")
+async def create_collection_comment_watch(job_id: int, content_id: int,
+                                          body: CollectionCommentWatchIn):
+    with get_session() as session:
+        work = _get_collection_content(session, job_id, content_id)
+        platform = work.platform
+        if not work.aweme_id:
+            raise HTTPException(400, "采集作品缺少作品 ID")
+        account_id = None if platform == "shipinhao" else body.account_id
+        if account_id is not None or platform in {"xhs", "tiktok"}:
+            account = session.get(DouyinAccount, account_id) if account_id is not None else None
+            if (not account or account.platform != platform or account.status != "active"
+                    or not (account.storage_state or account.creator_storage_state)):
+                raise HTTPException(400, "请选择当前平台已登录且有效的账号")
+            if platform == "xhs" and not _xhs_has_read_login_state(account.storage_state):
+                raise HTTPException(400, "请先完成小红书主站登录")
+        sec_uid = ""
+        if platform == "tiktok":
+            ref = parse_video_reference(work.source_url)
+            if not ref or ref.aweme_id != work.aweme_id:
+                raise HTTPException(400, "该采集作品缺少完整的 TikTok 作品链接，请重新采集后再添加监控")
+            sec_uid = ref.author_unique_id
+        xsec_token = work.xsec_token
+        if platform == "shipinhao" and not xsec_token:
+            ref = parse_channels_url(work.source_url)
+            xsec_token = ref.object_nonce_id if ref else ""
+        return _save_new_comment_watch(session, CommentWatch(
+            platform=platform, kind="video", mode="public", aweme_id=work.aweme_id,
+            sec_uid=sec_uid, xsec_token=xsec_token,
+            xsec_source=(work.xsec_source or "pc_search") if platform == "xhs" and xsec_token else "",
+            title=work.desc, account_id=account_id, interval_seconds=body.interval_seconds,
+        ), body.ai_policy)
 
 
 @app.post("/api/comment-watches")
@@ -9900,16 +9958,6 @@ async def add_watch(body: WatchIn):
                 raise HTTPException(400, "TikTok 评论监控必须选择一个登录有效的 TikTok 账号")
             if not (account.storage_state or account.creator_storage_state):
                 raise HTTPException(400, "所选 TikTok 账号缺少登录会话，请重新登录")
-        if kind == "video":
-            dup = s.exec(select(CommentWatch).where(CommentWatch.platform == platform)
-                         .where(CommentWatch.aweme_id == aweme_id)).first()
-        else:
-            dup = s.exec(select(CommentWatch).where(CommentWatch.platform == platform)
-                         .where(CommentWatch.kind != "video")
-                         .where(CommentWatch.sec_uid == sec_uid)
-                         .where(CommentWatch.mode == mode)).first()
-        if dup:
-            raise HTTPException(409, "已存在相同的评论监控")
         w = CommentWatch(platform=platform, kind=kind, aweme_id=aweme_id, sec_uid=sec_uid,
                           xsec_token=xsec_token, mode=mode, account_id=body.account_id,
                           interval_seconds=body.interval_seconds, title=title,
@@ -9919,8 +9967,7 @@ async def add_watch(body: WatchIn):
                           alias=_meta_text(body.alias, 60),
                           group_name=_meta_text(body.group_name, 40),
                           tags=_dump_meta_tags(_meta_tags(body.tags)))
-        s.add(w); s.commit(); s.refresh(w)
-        return _watch_dict(w)
+        return _save_new_comment_watch(s, w)
 
 
 @app.put("/api/comment-watches/{wid}")

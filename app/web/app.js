@@ -6681,14 +6681,15 @@ async function editCollection(jobId, draft = null) {
     $("ui-body").innerHTML = `
       <fieldset class="ui-form-group"><legend>采集范围</legend>
       ${initial.source_type === "keyword" ? `<div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
-        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "account_works" ? "本账号作品" : initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
+        <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词" aria-describedby="ecol-keywords-help">${esc(initial.keywords)}</textarea>
+        <p class="hint" id="ecol-keywords-help">词组内可以有空格，例如「餐饮 仓储系统」会作为一个搜索词。多个关键词用换行或逗号分隔，系统会去重后逐个搜索。</p></div>` : `<div class="form-note"><svg aria-hidden="true"><use href="#i-library"/></svg><span>采集来源：<b>${esc(initial.source_name || (initial.source_type === "account_works" ? "本账号作品" : initial.source_type === "favorite_all" ? "全部收藏" : "收藏夹"))}</b>。来源不可在续跑时切换，可新建任务选择其他来源。</span></div>`}
       <div class="form-grid">
         ${collectionRequiresAccount(job.platform, initial.source_type) || job.platform !== "shipinhao"
           ? `<div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, !collectionRequiresAccount(job.platform, initial.source_type) ? "使用本机微信通道（无需网页账号）" : (accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`))}</select></div>`
           : ""}
         ${job.platform === "douyin" ? '<div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}
         <div class="form-field"><label for="ecol-content-limit">每词作品上限</label><input id="ecol-content-limit" type="number" min="1" max="100" value="${Number(initial.max_contents_per_keyword) || 20}"></div>
-        <div class="form-field"><label for="ecol-comment-limit">每作品评论上限</label><input id="ecol-comment-limit" type="number" min="0" max="200" value="${Number(initial.max_comments_per_content) || 0}"></div>
+        <div class="form-field"><label for="ecol-comment-limit">每作品采集评论上限</label><input id="ecol-comment-limit" type="number" min="0" max="200" value="${Number(initial.max_comments_per_content) || 0}"></div>
       </div>
       </fieldset>
       <fieldset class="ui-form-group"><legend>搜索与停止条件</legend>
@@ -6746,7 +6747,7 @@ async function editCollection(jobId, draft = null) {
         if (value.max_pages_per_keyword < 1 || value.max_pages_per_keyword > 40) uiEditorError("每词采集深度须为 1–40 页", "ecol-page-limit");
         if (value.stagnant_pages < 1 || value.stagnant_pages > 8) uiEditorError("连续无新增停止阈值须为 1–8 页", "ecol-stagnant-pages");
         if (value.min_likes < 0 || value.min_comments < 0) uiEditorError("点赞和评论门槛须为非负整数", "ecol-min-likes");
-        if (value.max_comments_per_content < 0 || value.max_comments_per_content > 200) uiEditorError("每作品评论上限须为 0–200", "ecol-comment-limit");
+        if (value.max_comments_per_content < 0 || value.max_comments_per_content > 200) uiEditorError("每作品采集评论上限须为 0–200", "ecol-comment-limit");
         return api(`/api/collections/${job.id}`, {
           method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, platform: job.platform, keywords }),
         });
@@ -6853,6 +6854,7 @@ function collectionResultCard(item) {
         <button type="button" class="sm collection-preview-primary" onclick="openCollectionPreview(${item.job_id},${item.id})"${canPreview ? "" : " disabled"}>${ic("i-eye")}预览</button>
         ${fileExists ? `<button type="button" class="ghost sm" onclick="openCollectionFile(${item.job_id},${item.id},this)">${ic("i-external")}打开文件</button>` : ""}
         <button type="button" class="ghost sm" onclick="showCollectionComments(${item.id})"${item.collected_comment_count ? "" : " disabled"}>${ic("i-msg")}评论 ${item.collected_comment_count}</button>
+        <button type="button" class="ghost sm" data-platform="${esc(item.platform)}" data-work-title="${esc(title)}" onclick="openCollectionCommentWatch(${item.job_id},${item.id},this)">${ic("i-bell")}评论监控</button>
         <a class="collection-source-link" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">${ic("i-external")}原作品</a>
       </div>
     </div>
@@ -6860,6 +6862,60 @@ function collectionResultCard(item) {
 }
 function openCollectionPreview(jobId, contentId, startIdx = 0) {
   return _pvOpen(() => api(`/api/collections/${jobId}/contents/${contentId}/media`), startIdx);
+}
+async function openCollectionCommentWatch(jobId, contentId, button) {
+  const { platform, workTitle } = button.dataset;
+  const title = workTitle.replace(/\s+/g, " ").trim();
+  const hint = title.length > 120 ? title.slice(0, 120) + "…" : title;
+  const job = COLLECTION_JOBS.find(item => item.id === jobId);
+  const platformName = PF_NAME[platform] || "当前平台";
+  const needsAccount = ["xhs", "tiktok"].includes(platform);
+  const accounts = ACCOUNTS.filter(a => a.platform === platform && a.status === "active" && a.has_storage);
+  const preferredAccount = accounts.find(a => a.id === job?.account_id) || (needsAccount ? accounts[0] : null);
+  const accountPlaceholder = needsAccount
+    ? (accounts.length ? `请选择${platformName}账号` : `请先登录${platformName}账号`)
+    : "不指定账号";
+  const created = await new Promise(resolve => {
+    _uiResolve = resolve; _uiCancelVal = null;
+    _uiGetVal = () => {
+      const accountId = $("cw-account")?.value;
+      if (needsAccount && !accountId) uiEditorError(`请选择已登录的${platformName}账号`, "cw-account");
+      return {
+        account_id: accountId ? Number(accountId) : null,
+        interval_seconds: monitorIntervalSeconds("cw-interval"),
+        ai_policy: readWatchAIFields(),
+      };
+    };
+    $("ui-body").innerHTML = `
+      <fieldset class="monitor-config-group">
+        <legend>抓取设置</legend>
+        <div class="form-grid">
+          <div class="form-field"><label for="cw-interval">抓取频率</label><select id="cw-interval"></select></div>
+          ${platform === "shipinhao" ? "" : `<div class="form-field"><label for="cw-account">抓取账号</label><select id="cw-account">${accOptions(accounts, accountPlaceholder)}</select></div>`}
+        </div>
+      </fieldset>${watchAIFields()}`;
+    setupMonitorInterval("cw-interval", 600);
+    if (preferredAccount && $("cw-account")) $("cw-account").value = String(preferredAccount.id);
+    setupWatchAIFields();
+    enhanceSelect($("cw-interval"));
+    if ($("cw-account")) enhanceSelect($("cw-account"));
+    _uiOpen("作品评论监控", hint, {
+      okText: "开始监控", wide: true, icon: "i-msg",
+      submit: async value => {
+        try {
+          return await api(`/api/collections/${jobId}/contents/${contentId}/comment-watch`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value),
+          });
+        } catch (error) {
+          if (error.status === 409) throw new Error("该作品已有评论监控，可在评论监控列表中修改设置");
+          throw error;
+        }
+      },
+    });
+  });
+  if (!created) return;
+  toast("已开始监控此作品的评论", "ok");
+  if (PLATFORM === platform) refreshWatches().catch(() => {});
 }
 async function collectionLocalAction(jobId, contentId, action, button) {
   const old = button && button.innerHTML;

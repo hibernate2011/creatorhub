@@ -2306,12 +2306,12 @@
         <div class="form-field" id="col-keywords-wrap">
           <label for="col-keywords">关键词 <span class="field-scope">必填 · 最多 20 个</span></label>
           <textarea id="col-keywords" rows="5" placeholder="每行一个关键词，例如：&#10;露营装备&#10;城市骑行&#10;夏季穿搭" aria-describedby="col-keywords-help"></textarea>
-          <p class="hint" id="col-keywords-help">支持换行或逗号分隔；任务会按关键词逐个执行并自动去重。</p>
+          <p class="hint" id="col-keywords-help">词组内可以有空格，例如「餐饮 仓储系统」会作为一个搜索词。多个关键词用换行或逗号分隔，系统会去重后逐个搜索。</p>
         </div>
         <div class="form-grid cols-4">
           <div class="form-field" id="col-account-wrap"><label for="col-account">使用账号</label><select id="col-account" onchange="collectionAccountChanged()"></select></div>
           <div class="form-field"><label for="col-content-limit" id="col-content-limit-label">每词作品上限</label><input id="col-content-limit" type="number" min="1" max="100" value="20" inputmode="numeric"></div>
-          <div class="form-field"><label for="col-comment-limit">每作品评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
+          <div class="form-field"><label for="col-comment-limit">每作品采集评论上限</label><input id="col-comment-limit" type="number" min="0" max="200" value="20" inputmode="numeric"></div>
           <div class="form-field dy-only"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
         </div>
         <div class="form-grid cols-4 collection-filter-grid" aria-label="搜索深度与排序">

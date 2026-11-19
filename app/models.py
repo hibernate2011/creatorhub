@@ -332,6 +332,7 @@ class CommentWatch(SQLModel, table=True):
     aweme_id: str = ""             # video 模式:被盯的视频 / 笔记 note_id
     sec_uid: str = ""             # user 模式:被盯的账号 / 创作者 user_id
     xsec_token: str = ""          # 小红书:打开笔记/主页所需的安全令牌(可能过期)
+    xsec_source: str = ""         # 小红书:与采集所得令牌配套的来源
     title: str = ""               # 展示名(视频描述 / 账号昵称)
     avatar: str = ""
     alias: str = ""               # 管理别名
