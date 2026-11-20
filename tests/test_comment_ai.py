@@ -380,6 +380,45 @@ class CommentAITests(unittest.TestCase):
         self.assertTrue(row["sent_at"].endswith("+00:00"))
         self.assertNotIn("platform", row)
 
+    def test_bilibili_and_instagram_leads_keep_platform_links_in_delivery_history(self):
+        cases = [
+            ("bilibili", "1077998733285138440", "12345", "上海",
+             "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
+            ("instagram", "DdL0sPNt5jn", "buyer.a", "",
+             "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+        ]
+        self.config["prompts"] += [
+            dict(id=platform, name=platform, text="识别明确询价", platform=platform, work_ids=[work_id])
+            for platform, work_id, *_ in cases
+        ]
+        self.save()
+        with db.get_session() as session:
+            comments = [
+                CommentRecord(platform=platform, aweme_id=work_id, comment_id="shared-id",
+                              text="多少钱？", work_title="作品真实标题", user_sec_uid=user,
+                              ip_label=region, work_url=work_url if platform == "instagram" else "")
+                for platform, work_id, user, region, work_url, _ in cases
+            ]
+            session.add_all(comments)
+            self.assertEqual(ai.enqueue(session, comments, automatic=True)["queued"], 2)
+            keys = [ai.analysis_id(comment) for comment in comments]
+            session.commit()
+            self.assertEqual([session.get(CommentAnalysis, key).prompt_id for key in keys],
+                             ["bilibili", "instagram"])
+
+        self.analyze_all()
+        with db.get_session() as session:
+            for comment in session.exec(select(CommentRecord)).all():
+                session.delete(comment)
+            session.commit()
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))):
+            for _ in cases:
+                self.assertTrue(asyncio.run(ai.process_delivery()))
+        for platform, _, _, region, work_url, profile_url in cases:
+            [item] = ai.list_deliveries(platform)["items"]
+            self.assertEqual((item["work_url"], item["user_profile_url"], item["ip_label"]),
+                             (work_url, profile_url, region))
+
     def test_delivery_history_pages_legacy_successes_in_the_requested_platform(self):
         from app.main import app
 

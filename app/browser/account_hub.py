@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -277,6 +278,34 @@ def _norm_tiktok_work(it: dict) -> Optional[dict]:
     }
 
 
+def _norm_bili_work(it: dict) -> Optional[dict]:
+    from ..platforms.bilibili import parse_bili_aweme, parse_bili_creator_work
+    if isinstance(it, dict) and ("Archive" in it or "state_desc" in it):
+        return parse_bili_creator_work(it)
+    aweme = parse_bili_aweme(it)
+    if aweme is None:
+        return None
+    stat = it.get("stat") if isinstance(it.get("stat"), dict) else {}
+    return {
+        "item_id": aweme.aweme_id,
+        "desc": aweme.desc.splitlines()[0] if aweme.desc else "",
+        "media_type": aweme.media_type,
+        "cover_url": aweme.cover or "",
+        "create_time": aweme.create_time,
+        "like_count": aweme.like_count,
+        "comment_count": aweme.comment_count,
+        "collect_count": _num(_first(stat, "favorite", "fav", default=0) or _first(it, "favorites", default=0)),
+        "share_count": _num(_first(stat, "share", default=0)),
+        "play_count": _num(_first(stat, "view", default=0) or _first(it, "play", default=0)),
+        "status": "",
+    }
+
+
+def _norm_ig_work(it: dict) -> Optional[dict]:
+    from ..platforms.instagram import parse_ig_creator_work
+    return parse_ig_creator_work(it)
+
+
 async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid: str,
                               max_scrolls: int = 14) -> Tuple[List[dict], str]:
     """抓取登录账号自己发布的作品(复用各平台已有的主页拦截抓取)。
@@ -300,8 +329,8 @@ async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid:
                 uid = self3x
         except Exception as e:
             print(f"[hub-self] kuaishou self-resolve failed: {e!r}")
-    # 视频号:助手接口即本账号,不需要 uid
-    if not uid and not open_url and platform != "shipinhao":
+    # 视频号 / B站 / Instagram: 可直接按本账号 Cookie 读取自身资料与作品
+    if not uid and not open_url and platform not in ("shipinhao", "bilibili", "instagram"):
         return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」再同步作品"
 
     known: Set[str] = set()
@@ -310,6 +339,60 @@ async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid:
             items, _author, err = await fetch_channels_works(mgr, identity, known,
                                                              max_scrolls=max_scrolls)
             norm = _norm_channels_work
+        elif platform == "bilibili":
+            from ..platforms.bilibili import BilibiliClient
+            from .bili_fetcher import fetch_bili_videos
+            cookie_s = await _bili_cookie_str(mgr, identity)
+            if cookie_s:
+                client = BilibiliClient(
+                    cookie_s,
+                    getattr(identity, "user_agent", ""),
+                    proxy=getattr(identity, "proxy", ""),
+                )
+                async with client.session_scope():
+                    works, cerr = await client.fetch_all_creator_archives(
+                        max_pages=max(1, min(8, max_scrolls // 2 or 3))
+                    )
+                if works or cerr.startswith("logged_out") or cerr == "":
+                    return works, ("" if works else (cerr or "empty"))
+            if not uid:
+                return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」再同步作品"
+            items, _author, err = await fetch_bili_videos(
+                mgr, identity, uid, known, max_scrolls=max_scrolls
+            )
+            norm = _norm_bili_work
+        elif platform == "instagram":
+            from ..platforms.instagram import InstagramClient
+            from .ig_fetcher import fetch_ig_posts
+            cookie_s = await _ig_cookie_str(mgr, identity)
+            target_ref = uid
+            if cookie_s:
+                client = InstagramClient(
+                    cookie_s,
+                    getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+                    proxy=getattr(identity, "proxy", ""),
+                    account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+                    timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+                )
+                async with client.session_scope():
+                    if not target_ref:
+                        prof, perr = await client.fetch_self_profile()
+                        if perr.startswith(("logged_out:", "verification_required:")):
+                            return [], perr
+                        target_ref = str(prof.get("uid") or prof.get("unique_id") or client.self_uid)
+                    if target_ref:
+                        works, cerr = await client.fetch_all_creator_works(
+                            target_ref,
+                            max_pages=max(1, min(8, max_scrolls // 2 or 3)),
+                        )
+                        if works or cerr.startswith(("logged_out:", "verification_required:")):
+                            return works, ("" if works else cerr)
+            if not target_ref:
+                return [], "missing_uid:账号缺自身用户名或 uid,请先点账号「刷新资料」再同步作品"
+            items, _author, err = await fetch_ig_posts(
+                mgr, identity, target_ref, known, max_scrolls=max_scrolls
+            )
+            norm = _norm_ig_work
         elif platform == "tiktok":
             from .tiktok_fetcher import fetch_tiktok_profile_works
             items, err = await fetch_tiktok_profile_works(
@@ -429,10 +512,15 @@ def _norm_follow_user(d: dict, direction: str) -> Optional[dict]:
     for k in _ID_KEYS:
         if d.get(k):
             uid = str(d[k]); break
+    sec_uid = str(d.get("sec_uid") or d.get("secUid") or "")
+    if not uid or uid == "0":
+        uid = sec_uid
     nickname = ""
     for k in _NAME_KEYS:
         if d.get(k):
             nickname = str(d[k]); break
+    if not nickname and sec_uid:
+        nickname = str(d.get("unique_id") or d.get("short_id") or "已重置用户")
     if not uid or not nickname:
         return None
     # 关系判定:多平台字段兜底
@@ -644,18 +732,176 @@ _FOLLOW_PRECISE = {
 }
 
 
+_SCROLL_FOLLOW_LIST_JS = """() => {
+  const isScrollable = (el) => {
+    const s = getComputedStyle(el);
+    return (s.overflowY === 'auto' || s.overflowY === 'scroll' || s.overflowY === 'overlay')
+      && el.scrollHeight > el.clientHeight + 12;
+  };
+  const visibleRect = (el) => {
+    const r = el.getBoundingClientRect();
+    return (r.width > 120 && r.height > 120 && r.bottom > 0 && r.right > 0
+            && r.top < window.innerHeight && r.left < window.innerWidth) ? r : null;
+  };
+  const modalSelectors = [
+    '[data-e2e="user-fans-container"]',
+    '[data-e2e="user-following-container"]',
+    '[data-e2e*="fans-container"]',
+    '[data-e2e*="follow-container"]',
+    '[role="dialog"]',
+    '[aria-modal="true"]',
+    '.semi-modal-content',
+    '[class*="modal"]',
+    '[class*="Dialog"]',
+    '[class*="drawer"]',
+  ];
+  const modals = [];
+  const seenModal = new Set();
+  for (const sel of modalSelectors) {
+    for (const m of document.querySelectorAll(sel)) {
+      if (seenModal.has(m)) continue;
+      seenModal.add(m);
+      const r = visibleRect(m);
+      if (!r) continue;
+      if (r.width >= window.innerWidth * 0.98 && r.height >= window.innerHeight * 0.98
+          && m.getAttribute('role') !== 'dialog' && m.getAttribute('aria-modal') !== 'true') {
+        continue;
+      }
+      const links = m.querySelectorAll('a[href*="/user/"], a[href*="/profile/"]').length;
+      const imgs = m.querySelectorAll('img').length;
+      if (links > 0 || imgs >= 2 || m.getAttribute('role') === 'dialog') {
+        modals.push({ el: m, rect: r, score: links * 10 + imgs });
+      }
+    }
+  }
+  modals.sort((a, b) => b.score - a.score);
+  if (modals.length) {
+    const root = modals[0].el;
+    let best = null, bh = 0;
+    const candidates = [root, ...root.querySelectorAll('div,ul,section')];
+    for (const el of candidates) {
+      const r = el.getBoundingClientRect();
+      if (r.width < 100 || r.height < 80) continue;
+      if (isScrollable(el) && el.scrollHeight > bh) {
+        best = el;
+        bh = el.scrollHeight;
+      }
+    }
+    const target = best || root;
+    const tr = target.getBoundingClientRect();
+    if (best) {
+      best.scrollTop = best.scrollHeight;
+      best.dispatchEvent(new Event('scroll', { bubbles: true }));
+      const items = best.querySelectorAll('a[href*="/user/"], li, [class*="item"], [class*="Item"]');
+      if (items.length) {
+        try { items[items.length - 1].scrollIntoView({ block: 'end' }); } catch (_) {}
+      }
+    }
+    return {
+      inModal: true,
+      scrolled: !!best,
+      x: Math.max(10, Math.min(window.innerWidth - 10, Math.round(tr.left + tr.width / 2))),
+      y: Math.max(10, Math.min(window.innerHeight - 10, Math.round(tr.top + tr.height / 2))),
+    };
+  }
+  let best = null, bh = 0;
+  document.querySelectorAll('div,ul,section,main').forEach(el => {
+    if (isScrollable(el) && el.scrollHeight > el.clientHeight + 40 && el.scrollHeight > bh) {
+      best = el;
+      bh = el.scrollHeight;
+    }
+  });
+  if (best) {
+    best.scrollTop = best.scrollHeight;
+    best.dispatchEvent(new Event('scroll', { bubbles: true }));
+  }
+  window.scrollBy(0, 3000);
+  return {
+    inModal: false,
+    scrolled: !!best,
+    x: Math.round(window.innerWidth / 2),
+    y: Math.round(window.innerHeight / 2),
+  };
+}"""
+
+
 async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                         direction: str, known_uids: Set[str], settle_ms: int = 2000,
-                        max_scrolls: int = 40, *, _xhs_visible: bool = False
-                        ) -> Tuple[List[dict], str]:
+                        max_scrolls: int = 40, *, _xhs_visible: bool = False,
+                        progress=None) -> Tuple[List[dict], str]:
     """打开账号自己主页,切到「关注 / 粉丝」并滚动,拦截该页所有同域 XHR/GraphQL,
     启发式抽出用户对象。无公开接口,首版用于标定(日志打 api_seen)。
     返回 (归一后的用户 dict 列表, error)。"""
+    if platform == "instagram":
+        from ..platforms.instagram import InstagramClient
+        cookie_s = await _ig_cookie_str(mgr, identity)
+        if not cookie_s:
+            return [], "logged_out:缺少 Instagram 登录 Cookie"
+        client = InstagramClient(
+            cookie_s,
+            getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+        )
+        async with client.session_scope():
+            target_uid = (uid or client.self_uid or "").strip()
+            if not target_uid:
+                prof, perr = await client.fetch_self_profile()
+                if perr:
+                    return [], perr
+                target_uid = str(prof.get("uid") or prof.get("unique_id") or "")
+            if not target_uid:
+                return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」"
+            cap = max(50, min(400, max_scrolls * 10))
+            if direction == "fan":
+                return await client.fetch_followers(target_uid, max_count=cap)
+            return await client.fetch_following(target_uid, max_count=cap)
+    if platform == "bilibili":
+        from ..platforms.bilibili import BilibiliClient
+        cookie_s = await _bili_cookie_str(mgr, identity)
+        client = BilibiliClient(
+            cookie_s,
+            getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+        )
+        kind = "followers" if direction == "fan" else "following"
+        out_users: List[dict] = []
+        seen_ids: Set[str] = set()
+        async with client.session_scope():
+            target_mid = (uid or client.self_mid or "").strip()
+            if not target_mid:
+                prof, perr = await client.fetch_self_profile()
+                if perr:
+                    return [], perr
+                target_mid = str(prof.get("uid") or prof.get("sec_uid") or "")
+            if not target_mid:
+                return [], "missing_uid:账号缺自身 uid,请先点账号「刷新资料」"
+            max_pages = max(1, min(10, (max_scrolls // 4) or 3))
+            for pn in range(1, max_pages + 1):
+                batch, has_more, err = await client.fetch_follows(
+                    target_mid, kind=kind, pn=pn, ps=50
+                )
+                if err:
+                    return out_users, ("" if out_users else err)
+                all_known = bool(batch) and bool(known_uids)
+                for u in batch:
+                    uid_item = str(u.get("uid") or u.get("user_id") or "")
+                    if not uid_item:
+                        continue
+                    if uid_item not in known_uids:
+                        all_known = False
+                    if uid_item not in seen_ids:
+                        seen_ids.add(uid_item)
+                        out_users.append(u)
+                if not has_more or all_known:
+                    break
+        return out_users, ""
     if platform == "xhs" and not _xhs_visible:
         async with mgr.visible_action(identity):
             return await fetch_follows(
                 mgr, identity, platform, uid, direction, known_uids,
-                settle_ms, max_scrolls, _xhs_visible=True)
+                settle_ms, max_scrolls, _xhs_visible=True, progress=progress)
     nav = _FOLLOW_NAV.get(platform, _FOLLOW_NAV["douyin"])
     uid = (uid or "").strip()
     self_url = ""
@@ -689,6 +935,10 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
     error = ""
     precise_response_seen = False
     precise_empty_confirmed = False
+    precise_pages = 0
+    douyin_has_more: Optional[bool] = None
+    douyin_last_batch_empty = False
+    douyin_reported_total = 0
     precise_response_event = asyncio.Event()
     page = await mgr.new_page(identity, block_media=platform != "xhs")
     if platform == "xhs":
@@ -720,7 +970,8 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         return False
 
     async def on_response(resp):
-        nonlocal precise_response_seen, precise_empty_confirmed
+        nonlocal precise_response_seen, precise_empty_confirmed, precise_pages
+        nonlocal douyin_has_more, douyin_last_batch_empty, douyin_reported_total
         u = resp.url
         if host not in u or resp.request.resource_type not in ("xhr", "fetch"):
             return
@@ -752,17 +1003,35 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         precise = _is_follow_api(path.lower(), data)
         if precise and isinstance(data, dict) and data.get("status_code") in (None, 0, "0"):
             precise_response_seen = True
+            precise_pages += 1
             precise_response_event.set()
             # 抖音列表位于顶层 followers/followings；只有看到了明确的空数组，
             # 才能确认账号确实为 0，而不是解析器没对上新结构。
             expected_key = "followers" if direction == "fan" else "followings"
             if platform == "douyin" and isinstance(data.get(expected_key), list):
-                precise_empty_confirmed = len(data[expected_key]) == 0
+                batch_rows = data[expected_key]
+                precise_empty_confirmed = len(batch_rows) == 0 and len(collected) == 0
+                douyin_last_batch_empty = len(batch_rows) == 0
+                if data.get("total"):
+                    try:
+                        douyin_reported_total = max(
+                            douyin_reported_total, int(data.get("total") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if "has_more" in data:
+                    douyin_has_more = bool(data.get("has_more"))
             elif platform == "kuaishou" and isinstance(data.get("fols"), list):
                 precise_empty_confirmed = len(data["fols"]) == 0
         found: List[dict] = []
         _harvest_user_lists(data, found)
         if not found:
+            if precise and progress is not None:
+                try:
+                    cb = progress({"pages": precise_pages, "fetched": len(collected)})
+                    if inspect.isawaitable(cb):
+                        await cb
+                except Exception:
+                    pass
             return
         sink = collected if precise else broad
         added = 0
@@ -773,6 +1042,13 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                 added += 1
         if added and path not in hit_urls:
             hit_urls.append(("exact:" if precise else "candidate:") + path)
+        if precise and progress is not None:
+            try:
+                cb = progress({"pages": precise_pages, "fetched": len(collected)})
+                if inspect.isawaitable(cb):
+                    await cb
+            except Exception:
+                pass
 
     page.on("response", on_response)
     try:
@@ -872,8 +1148,15 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                     }
 
         stagnant = 0
-        for _ in range(max_scrolls):
+        stagnant_limit = 6 if platform == "douyin" else 4
+        scroll_limit = (max(max_scrolls, 500)
+                        if platform == "douyin" and max_scrolls == 40
+                        else max_scrolls)
+        for _ in range(scroll_limit):
+            if platform == "douyin" and douyin_has_more is False:
+                break
             before = len(collected) + len(broad) + len(scraped)
+            precise_response_event.clear()
             try:
                 if platform == "xhs":
                     drawer = page.locator(
@@ -883,23 +1166,27 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                         await drawer.hover()
                     await mgr.xhs_interaction.scroll_step(page)
                 else:
-                    # 其余平台保留原有列表容器滚动行为。
-                    await page.evaluate(
-                        "() => { let best=null,bh=0;"
-                        " document.querySelectorAll('div,ul,section,main').forEach(el=>{"
-                        "  const s=getComputedStyle(el);"
-                        "  if((s.overflowY==='auto'||s.overflowY==='scroll')"
-                        "     && el.scrollHeight>el.clientHeight+40 && el.scrollHeight>bh){best=el;bh=el.scrollHeight;}});"
-                        " if(best){best.scrollTop=best.scrollHeight;} window.scrollBy(0,3000); }")
-                    await page.mouse.wheel(0, 3000)
+                    # 优先定位关注/粉丝弹窗容器并在弹窗中心触发滚轮，避免主页作品区高度更大而滚错底层页面。
+                    pos = await page.evaluate(_SCROLL_FOLLOW_LIST_JS)
+                    if isinstance(pos, dict) and pos.get("x") and pos.get("y"):
+                        await page.mouse.move(int(pos["x"]), int(pos["y"]))
+                    await page.mouse.wheel(0, 2600)
             except Exception:
                 pass
-            if platform != "xhs":
+            if platform == "douyin":
+                try:
+                    await asyncio.wait_for(
+                        precise_response_event.wait(),
+                        timeout=max(1.5, settle_ms / 1000.0))
+                    await page.wait_for_timeout(180)
+                except Exception:
+                    pass
+            elif platform != "xhs":
                 await page.wait_for_timeout(settle_ms)
             await _xhs_scrape()
             if (len(collected) + len(broad) + len(scraped)) == before:
                 stagnant += 1
-                if stagnant >= 4:
+                if stagnant >= stagnant_limit:
                     break
             else:
                 stagnant = 0
@@ -942,7 +1229,18 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         else:
             error = error or (f"未拦截到{'关注' if direction=='following' else '粉丝'}列表"
                               "(没等到该方向专属接口,可能入口未点开/接口待标定)")
-    return list(result.values()), ("" if result else error)
+        return [], error
+    if (platform == "douyin" and douyin_has_more is True
+            and not douyin_last_batch_empty):
+        reached_total = (douyin_reported_total > 0
+                         and len(result) >= douyin_reported_total)
+        reached_fan_cap = (direction == "fan" and len(result) >= 4500)
+        if not reached_total and not reached_fan_cap:
+            return (
+                list(result.values()),
+                f"browser_pagination_incomplete:got={len(result)},pages={precise_pages}",
+            )
+    return list(result.values()), ""
 
 
 # ═══════════ 私信(无公开接口:拦截私信页 XHR;发送走 UI 自动化) ═══════════
@@ -1163,6 +1461,40 @@ async def _douyin_cookie_str(mgr: BrowserManager, identity) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cks)
 
 
+async def _bili_cookie_str(mgr: BrowserManager, identity) -> str:
+    """从账号专属 context 或 storage_state 提取 bilibili.com 完整 Cookie 串。"""
+    from ..platforms.bilibili import cookie_str_from_state
+    try:
+        ctx = await mgr.context_for(identity)
+        cks = await ctx.cookies([
+            "https://www.bilibili.com",
+            "https://member.bilibili.com",
+            "https://message.bilibili.com",
+        ])
+        if cks:
+            merged = {c["name"]: c["value"] for c in cks if c.get("name")}
+            if merged.get("SESSDATA"):
+                return "; ".join(f"{k}={v}" for k, v in merged.items())
+    except Exception:
+        pass
+    return cookie_str_from_state(getattr(identity, "storage_state", "") or "")
+
+
+async def _ig_cookie_str(mgr: BrowserManager, identity) -> str:
+    """从账号专属 context 或 storage_state 提取 instagram.com 完整 Cookie 串。"""
+    from ..platforms.instagram import cookie_str_from_state
+    try:
+        ctx = await mgr.context_for(identity)
+        cks = await ctx.cookies(["https://www.instagram.com", "https://i.instagram.com"])
+        if cks:
+            merged = {c["name"]: c["value"] for c in cks if c.get("name")}
+            if merged.get("sessionid"):
+                return "; ".join(f"{k}={v}" for k, v in merged.items())
+    except Exception:
+        pass
+    return cookie_str_from_state(getattr(identity, "storage_state", "") or "")
+
+
 async def _fetch_im_user_info(page, sec_ids: list) -> Dict[str, dict]:
     """在 douyin 页面内批量 POST /aweme/v1/web/im/user/info/(body sec_user_ids=[...]),
     抖音自己的 fetch 拦截器会补 a_bogus 签名。返回 sec_uid -> {nickname, avatar, sec_uid}。"""
@@ -1208,6 +1540,32 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                                  *, _xhs_visible: bool = False
                                  ) -> Tuple[List[dict], str]:
     """打开私信页,拦截会话列表 XHR,启发式抽会话。无公开接口,首版用于标定。"""
+    if platform == "instagram":
+        from ..platforms.instagram import InstagramClient
+        cookie_s = await _ig_cookie_str(mgr, identity)
+        if not cookie_s:
+            return [], "logged_out:缺少 Instagram 登录 Cookie"
+        client = InstagramClient(
+            cookie_s,
+            getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+        )
+        async with client.session_scope():
+            return await client.fetch_dm_conversations()
+    if platform == "bilibili":
+        from ..platforms.bilibili import BilibiliClient
+        cookie_s = await _bili_cookie_str(mgr, identity)
+        if not cookie_s:
+            return [], "logged_out:缺少 B 站登录 Cookie"
+        client = BilibiliClient(
+            cookie_s,
+            getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+        )
+        async with client.session_scope():
+            return await client.fetch_dm_sessions(size=100)
     if platform == "xhs":
         from .xhs_im import fetch_conversations as fetch_xhs_conversations
         return await fetch_xhs_conversations(
@@ -1667,6 +2025,42 @@ async def fetch_dm_history(mgr: BrowserManager, identity, platform: str,
     """无头抓单个会话的历史消息:imapi/v1/message/get_by_conversation(cmd 301)。
     该接口纯 cookie 鉴权、无 a_bogus/签名,用账号常驻 context 的 request 直接 POST。
     返回 (parse_messages 结果, error)。debug=True 时额外打印原始响应 b64(标定用)。"""
+    if platform == "instagram":
+        from ..platforms.instagram import InstagramClient
+        cookie_s = await _ig_cookie_str(mgr, identity)
+        if not cookie_s:
+            return {}, "logged_out:缺少 Instagram 登录 Cookie"
+        client = InstagramClient(
+            cookie_s,
+            getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+        )
+        async with client.session_scope():
+            msgs, err = await client.fetch_dm_history(
+                conv_id, max_pages=max(1, min(5, (count // 20) + 1))
+            )
+            if err:
+                return {}, err
+            return {"messages": msgs, "next_cursor": "", "has_more": False}, ""
+    if platform == "bilibili":
+        from ..platforms.bilibili import BilibiliClient
+        cookie_s = await _bili_cookie_str(mgr, identity)
+        if not cookie_s:
+            return {}, "logged_out:缺少 B 站登录 Cookie"
+        client = BilibiliClient(
+            cookie_s,
+            getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+        )
+        async with client.session_scope():
+            return await client.fetch_dm_messages(
+                peer_uid or conv_id,
+                size=count,
+                end_seqno=int(cursor or 0),
+                self_uid=self_uid,
+            )
     if platform == "xhs":
         from .xhs_im import fetch_history as fetch_xhs_history
         return await fetch_xhs_history(
@@ -1721,6 +2115,8 @@ _PROFILE_URL = {
     "douyin": "https://www.douyin.com/user/{sec}",
     "xhs": "https://www.xiaohongshu.com/user/profile/{uid}",
     "kuaishou": "https://www.kuaishou.com/profile/{uid}",
+    "bilibili": "https://space.bilibili.com/{uid}",
+    "instagram": "https://www.instagram.com/{sec}/",
 }
 
 
@@ -1844,6 +2240,36 @@ async def do_follow(mgr: BrowserManager, identity, platform: str, target_uid: st
     首次点击常常打空:按钮已渲染但 React handler 还没绑上(和粉丝/作品/私信
     入口同一个 hydrate 病)。所以点不动就重点,而不是直接判失败。
     """
+    if platform == "instagram":
+        from ..platforms.instagram import InstagramClient
+        cookie_s = await _ig_cookie_str(mgr, identity)
+        if not cookie_s:
+            return False, "logged_out:账号未登录"
+        client = InstagramClient(
+            cookie_s,
+            getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+        )
+        async with client.session_scope():
+            return await client.modify_follow(
+                target_uid or target_sec_uid, follow=not unfollow
+            )
+    if platform == "bilibili":
+        from ..platforms.bilibili import BilibiliClient
+        cookie_s = await _bili_cookie_str(mgr, identity)
+        if not cookie_s:
+            return False, "logged_out:账号未登录"
+        client = BilibiliClient(
+            cookie_s,
+            getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+        )
+        async with client.session_scope():
+            return await client.modify_follow(
+                target_uid or target_sec_uid, follow=not unfollow
+            )
     if platform == "xhs" and not _xhs_visible:
         async with mgr.visible_action(identity):
             return await do_follow(
@@ -1924,6 +2350,8 @@ _DM_ENTRY_URL = {
     "douyin": "https://www.douyin.com/user/{sec}",
     "xhs": "https://www.xiaohongshu.com/chat/{uid}",
     "kuaishou": "https://www.kuaishou.com/profile/{uid}",
+    "bilibili": "https://message.bilibili.com/#/whisper/mid{uid}",
+    "instagram": "https://www.instagram.com/direct/inbox/",
 }
 
 
@@ -1979,6 +2407,38 @@ async def send_dm(mgr: BrowserManager, identity, platform: str, target_uid: str 
     sec = target_sec_uid or target_uid
     url = _DM_ENTRY_URL.get(platform, _DM_ENTRY_URL["douyin"]).format(
         sec=sec, uid=target_uid or sec)
+    if platform == "instagram":
+        from ..platforms.instagram import InstagramClient
+        cookie_s = await _ig_cookie_str(mgr, identity)
+        if not cookie_s:
+            return False, "logged_out:缺少 Instagram 登录 Cookie"
+        client = InstagramClient(
+            cookie_s,
+            getattr(identity, "ua", "") or getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+        )
+        async with client.session_scope():
+            ok, err, _meta = await client.send_dm(
+                target_uid or target_sec_uid, text, on_submit=on_submit
+            )
+            return ok, err
+    if platform == "bilibili":
+        from ..platforms.bilibili import BilibiliClient
+        cookie_s = await _bili_cookie_str(mgr, identity)
+        if not cookie_s:
+            return False, "logged_out:缺少 B 站登录 Cookie"
+        client = BilibiliClient(
+            cookie_s,
+            getattr(identity, "user_agent", ""),
+            proxy=getattr(identity, "proxy", ""),
+        )
+        async with client.session_scope():
+            ok, err, _meta = await client.send_dm(
+                target_uid or target_sec_uid, text, on_submit=on_submit
+            )
+            return ok, err
     if platform == "xhs" and not _xhs_visible:
         async def _send_on_page(page):
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)

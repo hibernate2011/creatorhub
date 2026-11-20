@@ -1387,6 +1387,10 @@ class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
             ("shipinhao", "1234567890123", "finder-nonce", "", ""),
             ("tiktok", "7361234567890123456", "", "fixture.creator",
              "https://www.tiktok.com/@fixture.creator/video/7361234567890123456"),
+            ("bilibili", "1077998733285138440", "", "",
+             "https://www.bilibili.com/opus/1077998733285138440"),
+            ("instagram", "DdL0sPNt5jn", "", "",
+             "https://www.instagram.com/reel/DdL0sPNt5jn/"),
         ]
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                      base_url="http://127.0.0.1") as client:
@@ -1395,14 +1399,22 @@ class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
                     path, account_id = self.add_work(platform, aweme_id, xsec_token=token, source_url=source_url)
                     wrong_job_path = f"/api/collections/999/contents/{path.split('/contents/', 1)[1]}"
                     self.assertEqual((await client.post(wrong_job_path, json={})).status_code, 404)
-                    if platform in {"xhs", "tiktok"}:
+                    if platform in {"xhs", "tiktok", "instagram"}:
                         self.assertEqual((await client.post(path, json={})).status_code, 400)
-                    response = await client.post(path, json={"account_id": account_id})
+                    selected_account = None if platform == "bilibili" else account_id
+                    response = await client.post(path, json={"account_id": selected_account})
                     self.assertEqual(response.status_code, 200, response.text)
+                    if platform in {"bilibili", "instagram"}:
+                        duplicate = await client.post("/api/comment-watches", json={
+                            "platform": platform, "url_or_id": source_url, "account_id": selected_account,
+                        })
+                        self.assertEqual(duplicate.status_code, 409, duplicate.text)
                     with db.get_session() as session:
                         watch = session.get(CommentWatch, response.json()["id"])
                         self.assertEqual((watch.aweme_id, watch.sec_uid, watch.xsec_token), (aweme_id, author, token))
-                        self.assertEqual(watch.account_id, None if platform == "shipinhao" else account_id)
+                        self.assertEqual(watch.account_id, None if platform == "shipinhao" else selected_account)
+                        if platform == "instagram":
+                            self.assertEqual(watch.work_url, source_url)
 
     async def test_xhs_watch_uses_the_collected_token_source_when_scanning(self):
         from app.main import app

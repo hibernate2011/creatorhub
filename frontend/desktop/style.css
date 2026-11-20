@@ -1063,6 +1063,9 @@ kbd, .key-button {
 .pf-xhs { background: rgba(225, 29, 72, 0.12); color: #e11d48; }
 .pf-kuaishou { background: rgba(234, 88, 12, 0.12); color: #ea580c; }
 .pf-shipinhao { background: var(--success-bg); color: var(--success); }
+.pf-tiktok { background: rgba(13, 148, 136, 0.14); color: #0f766e; }
+.pf-bilibili { background: rgba(0, 174, 236, 0.14); color: #0077a8; }
+.pf-instagram { background: rgba(225, 48, 108, 0.14); color: #b81d58; }
 
 .guide-detail {
   min-width: 0;
@@ -1390,6 +1393,18 @@ kbd, .key-button {
 .path-block code {
   font: 11.5px/1.7 "SF Mono", Consolas, monospace;
   flex: 1;
+  word-break: break-all;
+}
+.directory-section {
+  padding-bottom: 20px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.directory-note {
+  margin-top: 10px;
+}
+.update-target-dir code {
+  font: 11.5px/1.6 "SF Mono", Consolas, monospace;
   word-break: break-all;
 }
 .data-list { margin: 24px 0; }

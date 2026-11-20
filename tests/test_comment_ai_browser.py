@@ -31,6 +31,9 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     rule.get_by_role("textbox", name="名称", exact=True).fill("装修客户")
     rule.get_by_role("textbox", name="判断标准").fill("询价或预约上门视为潜在客户")
     rule.get_by_role("textbox", name="排除的业务或行业关键词").fill("跨境物流，金融科技")
+    rule.get_by_role("button", name="适用平台", exact=True).click()
+    expect(page.get_by_role("option", name="哔哩哔哩", exact=True)).to_be_visible()
+    page.get_by_role("option", name="Instagram", exact=True).click()
     rule.locator('select[multiple]').select_option(["21", "22"])
     assert rule.locator('select[multiple]').evaluate("el => el.selectedOptions.length") == 2
     dialog.get_by_role("button", name="添加钉钉 / 飞书目标").click()
@@ -52,6 +55,7 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     expect(dialog).to_be_hidden()
     posted = json.loads(page.locator('html').get_attribute('data-fixture-ai-requests'))[-1]['body']
     assert posted["prompts"][1]["watch_ids"] == [21, 22]
+    assert posted["prompts"][1]["platform"] == "instagram"
     assert posted["destinations"][0]["type"] == "feishu"
     assert posted["destinations"][0]["threshold"] == .85
     assert [p["exclude_keywords"] for p in posted["prompts"]] == [["二手车"], ["跨境物流", "金融科技"]]

@@ -137,21 +137,27 @@ def test_workbench_custom_interval_layout_keyboard_and_platform_drafts(ui):
     assert errors == []
 
 
-def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui):
+@pytest.mark.parametrize("platform,account_id,video,profile", [
+    ("douyin", "1", "https://www.douyin.com/video/1234567890123456789", "https://www.douyin.com/user/test-profile"),
+    ("bilibili", "6", "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
+    ("instagram", "7", "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+])
+def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui, platform, account_id, video, profile):
     page, errors = ui
     page.set_default_timeout(8000)
+    page.evaluate("values => Object.assign(document.documentElement.dataset, values)",
+                  {"platform": platform, "video": video, "profile": profile})
     page.add_script_tag(content="""{
       const originalFetch = window.fetch;
       const created = [];
       const submitted = [];
-      const video = "https://www.douyin.com/video/1234567890123456789";
-      const profile = "https://www.douyin.com/user/test-profile";
+      const {platform, video, profile} = document.documentElement.dataset;
       const json = (data, status = 200) => new Response(JSON.stringify(data), {status});
       window.fetch = (path, opts = {}) => {
         if (path === "/api/share-download/links") {
           const {share_text} = JSON.parse(opts.body);
           const url = [video, profile].find(link => share_text.includes(link));
-          return Promise.resolve(json({links: url ? [{url, platform: "douyin"}] : []}));
+          return Promise.resolve(json({links: url ? [{url, platform}] : []}));
         }
         if (path === "/api/comment-watches" && opts.method === "POST") {
           const body = JSON.parse(opts.body);
@@ -166,15 +172,15 @@ def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui):
           created.push(watch);
           return Promise.resolve(json(watch));
         }
-        if (path === "/api/comment-watches?platform=douyin") return Promise.resolve(json(created));
+        if (path === "/api/comment-watches?platform=" + platform) return Promise.resolve(json(created));
         return originalFetch(path, opts);
       };
     }""")
+    if platform != "douyin":
+        page.locator(f'[data-pf="{platform}"]').first.click()
     navigate(page, "comments")
     page.locator("#wb-create").click()
     targets = page.locator("#w-url")
-    video = "https://www.douyin.com/video/1234567890123456789"
-    profile = "https://www.douyin.com/user/test-profile"
     targets.fill(f"作品分享 {video}")
     targets.press("End")
     targets.press("Enter")
@@ -186,7 +192,9 @@ def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui):
     expect(feedback).to_contain_text("已识别 3 条链接")
     assert targets.input_value() == f"{video}\n \n{profile}\ninvalid\n{video}"
 
-    page.locator("#w-acc").select_option("1", force=True)
+    if platform == "instagram":
+        expect(page.locator("#w-acc")).to_have_value(account_id)
+    page.locator("#w-acc").select_option(account_id, force=True)
     page.locator('.wb-sheet [data-composer="comments"] .wb-optional > summary').click()
     page.locator("#w-alias").fill("同批监控")
     submit = page.get_by_role("button", name="开始监控评论", exact=True)
@@ -205,6 +213,7 @@ def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui):
     assert all(body == posted[0] for body in posted)
     assert posted[0]["kind"] == "auto"
     assert posted[0]["alias"] == "同批监控"
-    assert posted[0]["account_id"] == 1
+    assert posted[0]["account_id"] == int(account_id)
+    assert posted[0]["platform"] == platform
     assert posted[0]["interval_seconds"] == 600
     assert errors == []

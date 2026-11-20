@@ -77,6 +77,8 @@ jobs:
       - name: Test Channels protocol and AI assistant
         run: >-
           python -m pytest
+          tests/test_bilibili_capabilities.py
+          tests/test_instagram_capabilities.py
           tests/test_channels_capabilities.py
           tests/test_channels_proxy.py
           tests/test_channels_protocol_ui.py
@@ -145,6 +147,8 @@ jobs:
           $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (!(Test-Path $compiler)) { throw "Inno Setup 6 compiler is required on the build runner" }
           python desktop/check_installer_language.py --compiler "$compiler"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python desktop/installer_assets.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $compiler "/DAppVersion=$env:APP_VERSION" desktop/installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -13,8 +13,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-from .platforms.channels.wmpf_cdp import inspect_endpoint_file
-
 
 TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
     # Douyin reads controlled by douyin_read_mode.
@@ -100,6 +98,83 @@ TRANSPORT_SPECS: tuple[dict[str, Any], ...] = (
      "requires_channels_cdp": True,
      "auth_protocol": "finderGetCommentDetail + finder-preview API + WxIsaac64 128KiB XOR",
      "wire_protocol": "HTTPS JSON + encrypted MP4 stream"},
+    # Bilibili WBI / Cookie / Broadcast Protobuf + member.bilibili.com RPA.
+    {"platform": "bilibili", "operation": "public_monitor", "label": "空间/搜索/评论/弹幕读取",
+     "setting": "bilibili_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "WBI w_rid/wts + buvid3/4 + SESSDATA",
+     "wire_protocol": "HTTPS JSON + deflate XML danmaku"},
+    {"platform": "bilibili", "operation": "account_works", "label": "本账号资料/创作中心稿件/统计",
+     "setting": "bilibili_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "SESSDATA + bili_jct + RSA-OAEP correspond refresh",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "bilibili", "operation": "following_list", "label": "关注列表同步",
+     "setting": "bilibili_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "SESSDATA + /x/relation/followings",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "bilibili", "operation": "followers_list", "label": "粉丝列表同步",
+     "setting": "bilibili_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "SESSDATA + /x/relation/followers",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "bilibili", "operation": "dm_sync", "label": "私信会话/历史与 Broadcast 推送",
+     "setting": "bilibili_read_mode", "api": True, "browser": False,
+     "auth_protocol": "SESSDATA + WBI new_sessions + Broadcast AuthReq",
+     "wire_protocol": "HTTPS JSON + WSS 8-type Protobuf WatchNotify"},
+    {"platform": "bilibili", "operation": "comment_write", "label": "评论/回复/点赞/删除与关注",
+     "setting": "bilibili_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "bili_jct CSRF + SESSDATA",
+     "wire_protocol": "x-www-form-urlencoded"},
+    {"platform": "bilibili", "operation": "dm_send", "label": "私信发送",
+     "setting": "bilibili_write_mode", "api": True, "browser": False,
+     "auth_protocol": "WBI (w_sender_uid/w_receiver_id/w_dev_id) + bili_jct",
+     "wire_protocol": "x-www-form-urlencoded"},
+    {"platform": "bilibili", "operation": "publish", "label": "视频投稿与图文动态发布",
+     "setting": "", "fixed": "browser", "api": False, "browser": True,
+     "auth_protocol": "member.bilibili.com RPA + add/v3 payload merge",
+     "wire_protocol": "UPOS + HTTPS JSON"},
+    # Instagram Mobile API v1 (Bearer IGT:2 + SIGNATURE.) + Web Session HTTP + Web RPA.
+    {"platform": "instagram", "operation": "public_monitor", "label": "主页/话题/Reels/评论读取",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + Web Cookie / X-CSRFToken",
+     "wire_protocol": "HTTPS JSON + chunked NDJSON (clips/user)"},
+    {"platform": "instagram", "operation": "account_works", "label": "本账号资料与作品列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + response header token writeback",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "following_list", "label": "关注列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + RankTokenCache (/friendships/following/)",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "followers_list", "label": "粉丝列表同步",
+     "setting": "instagram_read_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "Bearer IGT:2 + RankTokenCache (/friendships/followers/)",
+     "wire_protocol": "HTTPS JSON"},
+    {"platform": "instagram", "operation": "dm_sync", "label": "Direct v2 私信收件箱与历史同步",
+     "setting": "instagram_read_mode", "api": True, "browser": False,
+     "auth_protocol": "Bearer IGT:2 + Web direct_v2/inbox fallback",
+     "wire_protocol": "HTTPS JSON (microsecond timestamp)"},
+    {"platform": "instagram", "operation": "comment_write", "label": "评论/回复/点赞与关注",
+     "setting": "instagram_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first",
+     "auth_protocol": "signed_body=SIGNATURE. + HMAC-SHA256 user_breadcrumb",
+     "wire_protocol": "x-www-form-urlencoded"},
+    {"platform": "instagram", "operation": "dm_send", "label": "Direct v2 私信发送(文本/链接/图视)",
+     "setting": "instagram_write_mode", "api": True, "browser": False,
+     "auth_protocol": "Bearer IGT:2 + unique_time_id client_context",
+     "wire_protocol": "x-www-form-urlencoded (broadcast/text | link | configure_*)"},
+    {"platform": "instagram", "operation": "publish", "label": "图文/轮播/Reels/快拍发布",
+     "setting": "instagram_write_mode", "api": True, "browser": True,
+     "hybrid_order": "api_first", "native_browser_override": True,
+     "auth_protocol": "rupload_igphoto/igvideo + %20 SIGNATURE. configure + Web RPA",
+     "wire_protocol": "Binary stream + x-www-form-urlencoded"},
 )
 
 
@@ -146,6 +221,8 @@ def _channels_cdp_readiness(cfg: Any) -> dict[str, Any]:
             "error": "内置视频号代理已运行，请在桌面微信中打开一次视频号页面",
         }
     if endpoint_file:
+        from .platforms.channels.wmpf_cdp import inspect_endpoint_file
+
         info = inspect_endpoint_file(endpoint_file)
         ready = bool(info.get("exists") and info.get("valid"))
         return {
@@ -354,6 +431,10 @@ def build_transport_matrix(cfg: Any, accounts: Iterable[Any]) -> dict[str, Any]:
             "xhs_comment_write_mode": _setting_value(
                 cfg, "xhs_comment_write_mode", "browser"),
             "channels_read_mode": _setting_value(cfg, "channels_read_mode", "auto"),
+            "bilibili_read_mode": _setting_value(cfg, "bilibili_read_mode", "hybrid"),
+            "bilibili_write_mode": _setting_value(cfg, "bilibili_write_mode", "hybrid"),
+            "instagram_read_mode": _setting_value(cfg, "instagram_read_mode", "hybrid"),
+            "instagram_write_mode": _setting_value(cfg, "instagram_write_mode", "hybrid"),
             "channels_cdp_configured": channels_readiness["configured"],
             "channels_cdp_ready": channels_readiness["ready"],
             "channels_cdp_source": channels_readiness["source"],

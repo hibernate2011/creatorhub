@@ -1,6 +1,6 @@
 # CreatorHub
 
-本地运行的多平台内容管理工作台，支持 **抖音 / 小红书 / 快手 / 视频号 / TikTok**。
+本地运行的多平台内容管理工作台，支持 **抖音 / 小红书 / 快手 / 视频号 / TikTok / 哔哩哔哩 / Instagram**。
 
 [在线预览](https://3441293738.github.io/creatorhub/) · [平台能力](#平台能力) · [使用指南](https://3441293738.github.io/creatorhub/guide/) · [下载安装](https://github.com/3441293738/creatorhub/releases/latest) · [问题反馈](https://github.com/3441293738/creatorhub/issues) · [赞赏与交流](#赞赏与交流)
 
@@ -26,12 +26,16 @@
 | 快手 | 作品 / 评论监控、批量采集、下载与发布 |
 | 视频号 | 本账号作品、数据与发布；连接本机微信后支持关键词 / 创作者采集、作品 / 评论监控与加密视频下载 |
 | TikTok | 关键词视频采集、作品 / 评论监控、下载、视频发布与用户互动 |
+| 哔哩哔哩 | 关键词 / UP 主 / 本账号批量采集、视频与动态监控、评论 / XML 弹幕监控、下载、分区投稿 / 图文动态发布与私信管理 |
+| Instagram | 关键词 / 话题 / 创作者 / 本账号批量采集、主页与评论监控、轮播与 Reels 下载、单图 / 轮播 / Reels / Story 发布与 Direct 私信管理 |
 
 > 视频号读取他人内容和下载视频需要先在「设置 → 视频号微信通道」连接本机已登录的桌面微信；TikTok 当前支持单视频发布，暂不支持图文发布与直播。详细能力、操作步骤和使用限制见[使用指南](https://3441293738.github.io/creatorhub/guide/#welcome)。
 
 ## 快速开始
 
 ### 评论 AI 潜客分析
+
+评论监控支持逐行批量添加，也可以在采集结果中为单条作品开启监控。哔哩哔哩支持视频和动态，Instagram 支持帖子和 Reels，需要先绑定已登录账号。两个平台均支持按平台配置 AI 提示词、按目标设置分析和推送，并在推送记录中查看作品链接与可用的用户主页。
 
 在「评论监控 → AI 潜客分析配置」填写 OpenRouter API Key，可开启抓取后自动分析。历史评论可在「评论记录」中勾选后点击「分析所选」，也可点击「分析所有记录」，将所有平台尚未分析的评论加入队列，范围包含当前筛选和分页以外的记录。使用 [Gemini Decision 1](https://openrouter.ai/google/gemini-decision-1) 的 [Decisions API](https://openrouter.ai/docs/guides/community/multimodal-decisions)，使用同一提示词版本和排除规则的评论可以跨作品、跨平台合并请求。每条 Question 包含平台、作品标题、用户昵称和评论内容，昵称用于辅助判断行业与需求的匹配度。列表可按分析状态和潜客置信度筛选，当前结果导出遵循相同筛选。
 
@@ -45,8 +49,8 @@
 ### Windows 安装版（推荐）
 
 1. 在 [Releases](https://github.com/3441293738/creatorhub/releases/latest) 的 Assets 中下载 `CreatorHub-Setup-版本-windows-x64.exe`。
-2. 双击安装，通过桌面快捷方式启动。
-3. 点击「启动本地服务」，等待浏览器组件准备完成，打开工作台并登录账号。
+2. 双击运行安装向导，可保持默认位置或自由选择其他磁盘目录（如 `D:\CreatorHub`）安装，完成后通过快捷方式启动。
+3. 新版启动后自动准备工作台，打开面板并登录账号即可使用。
 
 适用于 Windows 10/11 x64，无需手动安装 Python；安装与首次启动请保持联网。版本更新见[更新与备份](https://3441293738.github.io/creatorhub/guide/#backup)。
 
@@ -78,7 +82,7 @@ chmod +x start.sh
 
 详细功能、平台差异、操作步骤和配置统一维护在 **[使用指南](https://3441293738.github.io/creatorhub/guide/)**：
 
-- 按平台上手：[抖音](https://3441293738.github.io/creatorhub/guide/douyin/) · [小红书](https://3441293738.github.io/creatorhub/guide/xhs/) · [快手](https://3441293738.github.io/creatorhub/guide/kuaishou/) · [视频号](https://3441293738.github.io/creatorhub/guide/shipinhao/) · [TikTok](https://3441293738.github.io/creatorhub/guide/tiktok/)
+- 按平台上手：[抖音](https://3441293738.github.io/creatorhub/guide/douyin/) · [小红书](https://3441293738.github.io/creatorhub/guide/xhs/) · [快手](https://3441293738.github.io/creatorhub/guide/kuaishou/) · [视频号](https://3441293738.github.io/creatorhub/guide/shipinhao/) · [TikTok](https://3441293738.github.io/creatorhub/guide/tiktok/) · [哔哩哔哩](https://3441293738.github.io/creatorhub/guide/bilibili/) · [Instagram](https://3441293738.github.io/creatorhub/guide/instagram/)
 - 日常使用：[功能手册](https://3441293738.github.io/creatorhub/guide/#monitor) · [配置与账号环境](https://3441293738.github.io/creatorhub/guide/#settings) · [更新与备份](https://3441293738.github.io/creatorhub/guide/#backup)
 - 开发参考：[配置示例](config.example.yaml) · [更新日志](CHANGELOG.md) · [文档维护](guide/README.md)
 

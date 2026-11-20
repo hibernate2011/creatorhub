@@ -140,7 +140,7 @@ function commentAIRemove(button) { button.closest('fieldset').remove(); }
 function commentAIAddPrompt(prompt = null) {
   const p = prompt || {id: commentAIId('prompt'), name: '', text: '', version: 1, enabled: true, platform: '', watch_ids: [], work_ids: [], groups: []};
   const isDefault = p.id === 'default';
-  const platformOptions = [['', '全部平台'], ['douyin', '抖音'], ['xhs', '小红书'], ['kuaishou', '快手'], ['shipinhao', '视频号'], ['tiktok', 'TikTok']];
+  const platformOptions = [['', '全部平台'], ...Object.entries(PF_NAME)];
   const watchOptions = COMMENT_AI_WATCHES.map(w => `<option value="${w.id}" ${p.watch_ids.includes(w.id) ? 'selected' : ''}>#${w.id} ${esc(w.alias || w.title || w.aweme_id || w.sec_uid)} (${esc(w.platform)} · ${w.kind === 'video' ? '作品' : '账号'})</option>`).join('');
   const missing = p.watch_ids.filter(id => !COMMENT_AI_WATCHES.some(w => w.id === id)).map(id => `<option value="${id}" selected>#${id} 已删除的监控任务</option>`).join('');
   $('cai-prompts').insertAdjacentHTML('beforeend', `<fieldset data-prompt="${esc(p.id)}" style="padding:14px;margin:14px 0;border:1px solid var(--border);border-radius:10px;min-width:0">

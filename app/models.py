@@ -1,4 +1,4 @@
-"""数据模型 (SQLModel)。精简自逆向的 DouyinAccount / MonitorTarget / ContentRecord。"""
+"""SQLModel 持久化数据模型定义。"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -279,7 +279,7 @@ class RiskAdminAudit(SQLModel, table=True):
 
 
 class NotificationChannel(SQLModel, table=True):
-    """通知渠道。对应逆向 model.NotificationChannel。"""
+    """外部消息通知渠道配置表。"""
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""
     type: str = "bark"             # bark | dingtalk | telegram
@@ -330,6 +330,7 @@ class CommentWatch(SQLModel, table=True):
     platform: str = Field(default="douyin", index=True)  # douyin | xhs
     kind: str = "video"            # video(单条视频/笔记) | user(账号/创作者近期作品)
     aweme_id: str = ""             # video 模式:被盯的视频 / 笔记 note_id
+    work_url: str = ""             # Instagram 帖子、Reels 等原始路径
     sec_uid: str = ""             # user 模式:被盯的账号 / 创作者 user_id
     xsec_token: str = ""          # 小红书:打开笔记/主页所需的安全令牌(可能过期)
     xsec_source: str = ""         # 小红书:与采集所得令牌配套的来源
@@ -368,6 +369,8 @@ class PublishTask(SQLModel, table=True):
     allow_comment: bool = True                         # TikTok:允许评论
     allow_duet: bool = True                            # TikTok:允许 Duet
     allow_stitch: bool = True                          # TikTok:允许 Stitch
+    bili_options_json: str = "{}"                      # B站投稿扩展参数(tid/copyright/source/recreate/声明/互动开关等)
+    ig_options_json: str = "{}"                        # Instagram发布扩展参数(post_kind=auto|reel|post|story, share_to_feed等)
     scheduled_at: Optional[datetime] = None            # UTC；空=尽快发
     scheduled_at_is_utc: bool = True  # 存量无时区预约需要人工确认，不自动猜时区
     status: str = "pending"        # draft | pending | publishing | uncertain | done | failed | canceled
@@ -420,6 +423,7 @@ class CommentAnalysis(SQLModel, table=True):
     user_profile_url: str = ""
     ip_label: str = ""
     work_title: str = ""
+    work_url: str = ""
     prompt_id: str = "default"
     prompt_name: str = ""
     prompt_version: int = 1

@@ -1,4 +1,4 @@
-"""从抖音作品 JSON 提取可下载媒体。对应逆向 engine.ContentChecker.processVideo 的解析部分。"""
+"""从作品原始 JSON 提取规范化媒体元数据与下载条目。"""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,7 @@ class MediaItem:
     ext: str           # "mp4" | "jpeg" ...
     index: int = 0
     decode_key: str = ""  # 视频号加密 CDN 的 uint64 十进制解码密钥(非空且非 "0" 时下载后离线解密)
+    audio_url: str = ""   # B站 DASH 音视频分离流时的独立音频轨地址(非空时下载后无损封装 MP4)
 
 
 @dataclass
@@ -31,7 +32,7 @@ class Aweme:
     comment_count: int = 0
     duration: int = 0           # 秒
     avatar: str = ""            # 作者头像
-    platform: str = "douyin"    # douyin | xhs | kuaishou | shipinhao | tiktok(决定下载时的 Referer)
+    platform: str = "douyin"    # douyin | xhs | kuaishou | shipinhao | tiktok | bilibili | instagram(决定下载时的 Referer)
     source_url: str = ""        # 平台作品规范链接（可用时持久化，避免后续猜链接）
     author_unique_id: str = ""  # TikTok/视频号等平台构造规范作品链接所需的公开账号名
     object_nonce_id: str = ""   # 视频号原生协议所需的 objectNonceId

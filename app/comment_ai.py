@@ -29,6 +29,8 @@ from .monitor_metadata import load_tags
 from .notification_config import MASK, redact_detail
 from .notifier import send_one
 from .notifier.rate_limit import WebhookBusy, WebhookRateLimited, robot_key, webhook_ready
+from .platforms.bilibili.resolve import work_page_url as bili_work_url
+from .platforms.instagram.resolve import clean_ig_username, work_page_url as ig_work_url
 
 log = logging.getLogger(__name__)
 MODEL = "google/gemini-decision-1"
@@ -62,7 +64,7 @@ class PromptIn(BaseModel):
     text: str = Field(min_length=1, max_length=12000)
     exclude_keywords: list[str] = Field(default_factory=list)
     version: int = 1
-    platform: Literal["", "douyin", "xhs", "kuaishou", "shipinhao", "tiktok"] = ""
+    platform: Literal["", "douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"] = ""
     watch_ids: list[int] = Field(default_factory=list, max_length=500)
     work_ids: list[str] = Field(default_factory=list, max_length=500)
     groups: list[str] = Field(default_factory=list, max_length=100)
@@ -283,7 +285,8 @@ def resolve_prompt(config, row, watch):
 def clean_work_title(value: str, aweme_id: str) -> str:
     title = value.strip() if isinstance(value, str) else ""
     if title == aweme_id or any(title == f"{label} {aweme_id}"
-                                 for label in ("视频", "作品", "笔记", "视频号作品")):
+                                 for label in ("视频", "作品", "笔记", "视频号作品", "B站稿件",
+                                               "IG p", "IG reel", "IG tv", "IG story")):
         return ""
     if title.startswith("@") and title.partition(" ")[2] == f"视频 {aweme_id}":
         return ""
@@ -294,12 +297,15 @@ def find_work_title(session, platform: str, aweme_id: str, saved_title: str = ""
     title = clean_work_title(saved_title, aweme_id)
     if title or not aweme_id:
         return title
-    for model, column, work_id in (
+    recorded_title = (CommentRecord, CommentRecord.work_title, CommentRecord.aweme_id)
+    sources = (
         (CommentWatch, CommentWatch.title, CommentWatch.aweme_id),
         (ContentRecord, ContentRecord.desc, ContentRecord.aweme_id),
         (AccountWork, AccountWork.desc, AccountWork.item_id),
-        (CommentRecord, CommentRecord.work_title, CommentRecord.aweme_id),
-    ):
+    )
+    # Instagram watch names can include the creator's display name.
+    for model, column, work_id in ((recorded_title, *sources) if platform == "instagram"
+                                   else (*sources, recorded_title)):
         candidates = session.exec(select(column).where(
             model.platform == platform, work_id == aweme_id, column != ""
         ).order_by(model.id.desc()))
@@ -331,11 +337,14 @@ def enqueue(session, rows, *, automatic=False):
         key = analysis_id(row)
         existing = session.get(CommentAnalysis, key) if row.comment_id else None
         region = (row.ip_label or "").strip()
+        work_url = row.work_url if row.platform == "instagram" else ""
         if existing:
             if not existing.comment_create_time and row.create_time:
                 existing.comment_create_time = row.create_time
             if not existing.ip_label and region:
                 existing.ip_label = region
+            if not existing.work_url and work_url:
+                existing.work_url = work_url
             if automatic and auto_enabled(config, policy, "auto_forward"):
                 queue_deliveries(session, existing, watch_destinations(config, watch, policy),
                                  watch_id=row.watch_id or 0, automatic=True)
@@ -356,7 +365,7 @@ def enqueue(session, rows, *, automatic=False):
             comment_create_time=row.create_time or 0,
             user_nickname=row.user_nickname, user_sec_uid=row.user_sec_uid,
             user_profile_url=row.user_profile_url, ip_label=region,
-            work_title=title, prompt_id=prompt["id"], prompt_name=prompt["name"],
+            work_title=title, work_url=work_url, prompt_id=prompt["id"], prompt_name=prompt["name"],
             prompt_version=prompt["version"], prompt=prompt["text"],
             exclude_keywords=json.dumps(prompt["exclude_keywords"], ensure_ascii=False))
         result = session.execute(insert(CommentAnalysis).values(**item.model_dump()).on_conflict_do_nothing())
@@ -626,6 +635,17 @@ def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
     profile = row.user_profile_url
     if not profile and row.platform in profile_urls and row.user_sec_uid:
         profile = profile_urls[row.platform] + quote(row.user_sec_uid, safe="")
+    if row.platform == "bilibili":
+        work_url = bili_work_url(row.aweme_id)
+        if not profile and row.user_sec_uid.isascii() and row.user_sec_uid.isdigit():
+            profile = f"https://space.bilibili.com/{row.user_sec_uid}"
+    elif row.platform == "instagram":
+        source_url = row.work_url
+        if not source_url and watch and watch.platform == row.platform and watch.aweme_id == row.aweme_id:
+            source_url = watch.work_url
+        work_url = ig_work_url(row.aweme_id, source_url)
+        if not profile and (username := clean_ig_username(row.user_sec_uid)):
+            profile = f"https://www.instagram.com/{username}/"
     return {
         "confidence": f"{row.confidence:.1%}" if row.confidence is not None else "",
         "group_tags": group_tags,
@@ -664,6 +684,12 @@ def _fill_missing_comment_metadata(session, analysis):
         CommentRecord.aweme_id == analysis.aweme_id,
         CommentRecord.comment_id == analysis.comment_id,
     )
+    if analysis.platform == "instagram" and not analysis.work_url:
+        work_url = session.exec(select(CommentRecord.work_url).where(
+            *source_match, CommentRecord.work_url != "",
+        ).order_by(CommentRecord.id)).first()
+        if work_url:
+            analysis.work_url = work_url
     if not analysis.comment_create_time:
         timestamp = session.exec(select(CommentRecord.create_time).where(
             *source_match, CommentRecord.create_time > 0,

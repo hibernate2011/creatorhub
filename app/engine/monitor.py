@@ -1,5 +1,5 @@
-"""监控引擎。对应逆向 engine.MonitorEngine + ContentChecker。
-后台循环:到点的目标 -> 真实浏览器抓新作品 -> 入库 -> 下载。
+"""多平台监控、发布与社交互动调度引擎。
+后台循环:到点的目标 -> 抓取新作品与评论 -> 入库 -> 下载与通知。
 """
 from __future__ import annotations
 
@@ -27,6 +27,10 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        post_ks_comment,
                        fetch_channels_works, fetch_channels_comments,
                        fetch_channels_self_profile, post_channels_comment,
+                       fetch_bili_videos, fetch_bili_search, fetch_bili_comments,
+                       fetch_bili_self_profile, post_bili_comment,
+                       fetch_ig_posts, fetch_ig_search, fetch_ig_comments,
+                       fetch_ig_self_profile, post_ig_comment,
                        fetch_account_works, fetch_douyin_account_works_api,
                        do_follow, send_dm, send_dm_api,
                        douyin_secure_post_api)
@@ -73,6 +77,20 @@ from ..platforms.channels.resolve import work_page_url as channels_work_url
 from ..platforms.tiktok import (TikTokNativeClient, parse_tiktok_aweme,
                                 parse_tiktok_comment, publish_tiktok,
                                 tiktok_display_text)
+from ..platforms.bilibili import (
+    BilibiliClient,
+    cookie_map_from_state as bili_cookie_map,
+    parse_bili_aweme,
+    publish_bilibili,
+)
+from ..platforms.bilibili.resolve import work_page_url as bili_work_url
+from ..platforms.instagram import (
+    InstagramClient,
+    cookie_map_from_state as ig_cookie_map,
+    parse_ig_aweme,
+    publish_instagram,
+)
+from ..platforms.instagram.resolve import work_page_url as ig_work_url
 from ..platforms.tiktok.urls import profile_url as tiktok_profile_url
 from ..platforms.tiktok.urls import video_url as tiktok_video_url
 from ..models import (ContentRecord, CommentRecord, CommentRule, CommentTask,
@@ -371,6 +389,7 @@ class MonitorEngine:
         self._inflight: set = set()           # 正在抓取的目标,避免同目标并发
         self._publish_sem = asyncio.Semaphore(1)   # 发布串行(有头浏览器,一次一个)
         self._publishing: set[int] = set()
+        self._publish_stages: dict[int, str] = {}
         self._commenting: set[int] = set()         # 正在执行的评论任务 id
         self._actioning: set[int] = set()           # 正在执行的写操作任务 id
         self._collection_tasks: dict[int, asyncio.Task] = {}  # 一次性关键词采集
@@ -957,10 +976,57 @@ class MonitorEngine:
         task.add_done_callback(done)
         return True
 
+    async def cancel_collection_job(self, job_id: int, *, timeout: float = 2.0) -> bool:
+        """立即中断执行中的采集协程（或清理孤立 running 记录），落库为已取消并释放队列槽位。"""
+        task = self._collection_tasks.get(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait({task}, timeout=max(0.1, float(timeout)))
+            except Exception:
+                pass
+        self._collection_tasks.pop(job_id, None)
+        canceled_now = False
+        with get_session() as s:
+            job = s.get(KeywordCollectionJob, job_id)
+            if job and job.status in {"pending", "running"}:
+                job.cancel_requested = True
+                job.status = "canceled"
+                job.current_step = "已取消"
+                job.finished_at = job.finished_at or datetime.utcnow()
+                s.add(job)
+                s.commit()
+                self._log_collection_operation(job, "canceled", "canceled", "用户取消任务")
+                canceled_now = True
+            elif job and job.status == "canceled":
+                canceled_now = True
+        if self._running and not self._collection_tasks:
+            try:
+                asyncio.create_task(self._process_collection_jobs())
+            except RuntimeError:
+                pass
+        return canceled_now
+
     async def _process_collection_jobs(self) -> None:
         if self._collection_tasks:
             return
         with get_session() as s:
+            orphans = s.exec(
+                select(KeywordCollectionJob).where(KeywordCollectionJob.status == "running")
+            ).all()
+            if orphans:
+                now_utc = datetime.utcnow()
+                for orphan in orphans:
+                    if orphan.cancel_requested:
+                        orphan.status = "canceled"
+                        orphan.current_step = "已取消"
+                        orphan.finished_at = orphan.finished_at or now_utc
+                    else:
+                        orphan.status = "pending"
+                        orphan.current_step = "等待继续"
+                        orphan.finished_at = None
+                    s.add(orphan)
+                s.commit()
             jobs = s.exec(
                 select(KeywordCollectionJob)
                 .where(KeywordCollectionJob.status == "pending")
@@ -1392,6 +1458,41 @@ class MonitorEngine:
                     # falsely marks a valid TikTok profile as logged out.
                     u, err = await fetch_tiktok_self_profile(
                         self.browser, identity, block_media=True)
+                elif platform == "bilibili":
+                    bmode = str(getattr(
+                        self.cfg.engine, "bilibili_read_mode", "hybrid") or "hybrid").lower()
+                    u, err = {}, ""
+                    if bmode in {"api", "hybrid"} and state:
+                        bcli = BilibiliClient(
+                            state, identity.ua or self.cfg.engine.user_agent,
+                            proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds)
+                        async with bcli.session_scope():
+                            u, err = await bcli.fetch_self_profile()
+                    elif bmode == "api" and not state:
+                        u, err = {}, "logged_out:缺少 B 站登录态"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if bmode == "browser" or (not u and bmode == "hybrid" and not auth_failed):
+                        u, err = await fetch_bili_self_profile(self.browser, identity)
+                elif platform == "instagram":
+                    imode = str(getattr(
+                        self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+                    u, err = {}, ""
+                    if imode in {"api", "hybrid"} and state:
+                        icli = InstagramClient(
+                            state,
+                            identity.ua or self.cfg.engine.user_agent,
+                            proxy=proxy,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            account_seed=getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""),
+                            timezone_id=getattr(identity, "timezone_id", "Asia/Shanghai"),
+                        )
+                        async with icli.session_scope():
+                            u, err = await icli.fetch_self_profile()
+                    elif imode == "api" and not state:
+                        u, err = {}, "logged_out:缺少 Instagram 登录态"
+                    auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+                    if imode == "browser" or (not u and imode == "hybrid" and not auth_failed):
+                        u, err = await fetch_ig_self_profile(self.browser, identity)
                 else:
                     u, err = await fetch_self_profile(self.browser, identity)
                 if u:
@@ -1426,6 +1527,8 @@ class MonitorEngine:
                         "following_count": int(u.get("following_count") or 0),
                         "aweme_count": int(u.get("video_count") or 0),
                     }
+                elif platform in {"bilibili", "instagram"}:
+                    parsed = dict(u)
                 else:
                     parsed = parse_self_user(u)
                 account.status = "active"
@@ -1433,9 +1536,11 @@ class MonitorEngine:
                 if parsed.get("nickname"):
                     account.nickname = parsed["nickname"]
                 account.sec_uid = parsed.get("sec_uid") or account.sec_uid
+                if parsed.get("uid"):
+                    account.uid = str(parsed["uid"])
                 account.douyin_id = parsed.get("douyin_id") or account.douyin_id
                 account.avatar = parsed.get("avatar") or account.avatar
-                if platform in {"kuaishou", "tiktok"}:
+                if platform in {"kuaishou", "tiktok", "bilibili", "instagram"}:
                     account.follower_count = int(parsed.get("follower_count") or 0)
                     account.following_count = int(parsed.get("following_count") or 0)
                     account.aweme_count = int(parsed.get("aweme_count") or 0)
@@ -1535,7 +1640,9 @@ class MonitorEngine:
             return
         self._last_work_health = now
         with get_session() as s:
-            accs = [(a.id, a.platform, a.sec_uid or "", self.browser.identity_for(a))
+            accs = [(a.id, a.platform,
+                     (a.sec_uid or a.uid or a.douyin_id or "") if a.platform == "instagram" else (a.sec_uid or ""),
+                     self.browser.identity_for(a))
                     for a in s.exec(select(DouyinAccount)).all()
                     if a.status != "invalid" and (a.storage_state or a.creator_storage_state)]
         for aid, platform, uid, identity in accs:
@@ -1728,6 +1835,477 @@ class MonitorEngine:
         finally:
             self._inflight.discard(target_id)
 
+    async def _scan_bilibili_target_locked(self, target_id: int) -> dict:
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "target not found"}
+            first_scan = target.last_scan_at is None
+            acc = s.get(DouyinAccount, target.account_id) if target.account_id else None
+            if target.account_id and (not acc or acc.platform != "bilibili" or acc.status != "active"):
+                return self._mark_target_skip(
+                    target_id, "绑定的哔哩哔哩账号不存在或登录态已失效，请重新绑定/登录"
+                )
+            if acc and self._proxy_bad(acc):
+                return self._mark_target_skip(
+                    target_id, "账号代理标记为不可用(proxy bad)，已跳过以免暴露真实 IP"
+                )
+            identity = (
+                self.browser.identity_for(acc)
+                if (acc is not None and callable(getattr(self.browser, "identity_for", None)))
+                else (
+                    self.browser.anon_identity()
+                    if callable(getattr(self.browser, "anon_identity", None))
+                    else None
+                )
+            )
+            proxy = (acc.proxy or "") if acc is not None else ""
+            state = (acc.storage_state or acc.cookie or "") if acc is not None else ""
+            ua = (acc.ua if acc and acc.ua else self.cfg.engine.user_agent)
+            known = set(
+                s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
+            )
+            known_create_times = list(
+                s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
+            )
+            target_kind = target.target_kind or "creator"
+            sec_uid = (target.sec_uid or "").strip()
+            keyword = (target.keyword or "").strip()
+            base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
+            quality = target.video_quality or get_setting("video_quality", "highest")
+            monitor_since = int(target.created_at.timestamp())
+            scan_since = _douyin_scan_since(monitor_since, known_create_times)
+            backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
+            auto_download = target.download_enabled
+            media_filter = target.media_filter or "all"
+            strategy = _monitor_strategy(target, default_scrolls=4, default_items=0)
+
+        mode = str(getattr(self.cfg.engine, "bilibili_read_mode", "hybrid") or "hybrid").lower()
+        bcli = BilibiliClient(
+            state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+        )
+        raw_items: list[dict] = []
+        author_name = ""
+        author_avatar = ""
+        error = ""
+
+        async with bcli.session_scope():
+            if mode in {"api", "hybrid"}:
+                max_pages = max(1, min(6, strategy["max_scrolls"] or 2))
+                for pn in range(1, max_pages + 1):
+                    if target_kind == "keyword":
+                        batch, has_more, err = await bcli.search_videos(
+                            keyword, page=pn, page_size=20, order="pubdate"
+                        )
+                    else:
+                        batch, has_more, err = await bcli.fetch_user_videos(
+                            sec_uid, pn=pn, ps=30, order="pubdate"
+                        )
+                    if err:
+                        error = err
+                        break
+                    raw_items.extend(batch)
+                    if not has_more or (known and batch and all(str(r.get("bvid") or "") in known for r in batch)):
+                        break
+
+            if (mode == "browser" or (mode == "hybrid" and not raw_items and error)) and identity is not None:
+                if target_kind == "keyword":
+                    b_items, b_err = await fetch_bili_search(
+                        self.browser, identity, keyword, max_scrolls=max(1, min(4, strategy["max_scrolls"] or 2))
+                    )
+                    if b_items:
+                        raw_items, error = b_items, ""
+                    elif mode == "browser":
+                        error = b_err
+                else:
+                    b_items, b_author, b_err = await fetch_bili_videos(
+                        self.browser, identity, sec_uid, known,
+                        max_scrolls=max(1, min(4, strategy["max_scrolls"] or 2))
+                    )
+                    if b_items:
+                        raw_items, author_name, error = b_items, b_author, ""
+                    elif mode == "browser":
+                        error = b_err
+
+            candidates: list[Aweme] = []
+            seen_ids: set[str] = set()
+            for r in raw_items:
+                aw = parse_bili_aweme(r, require_media=False)
+                if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
+                    continue
+                seen_ids.add(aw.aweme_id)
+                if aw.author_name and not author_name and target_kind == "creator":
+                    author_name = aw.author_name
+                if aw.avatar and not author_avatar and target_kind == "creator":
+                    author_avatar = aw.avatar
+                candidates.append(aw)
+
+            candidates.sort(key=lambda a: int(a.create_time or 0), reverse=True)
+            if should_backfill:
+                if backfill_count == 0:
+                    candidates = [a for a in candidates if not a.create_time or a.create_time >= monitor_since]
+                elif backfill_count > 0:
+                    candidates = candidates[:backfill_count]
+            else:
+                candidates = [a for a in candidates if not a.create_time or a.create_time >= scan_since]
+
+            new_records = []
+            filtered_count = 0
+            for aw in candidates:
+                if not _monitor_content_matches(aw, strategy):
+                    filtered_count += 1
+                    continue
+                if strategy["max_items"] and len(new_records) >= strategy["max_items"]:
+                    break
+                should_download = auto_download and (
+                    media_filter == "all" or aw.media_type == media_filter
+                )
+                play_err = ""
+                if should_download and not aw.medias:
+                    full_aw, play_err = await bcli.fetch_aweme_by_work(
+                        aw.aweme_id, with_play_url=True, quality=quality
+                    )
+                    if full_aw is not None:
+                        aw = full_aw
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                        **(
+                            {"audio_url": m.audio_url}
+                            if getattr(m, "audio_url", "")
+                            else {}
+                        ),
+                    }
+                    for m in aw.medias
+                ])
+                rec = ContentRecord(
+                    platform="bilibili",
+                    target_id=target_id,
+                    aweme_id=aw.aweme_id,
+                    desc=aw.desc,
+                    media_type=aw.media_type,
+                    quality=aw.quality_label,
+                    create_time=aw.create_time,
+                    cover_url=aw.cover or "",
+                    like_count=aw.like_count,
+                    comment_count=aw.comment_count,
+                    duration=aw.duration,
+                    media_json=media_json,
+                    download_status="pending" if (should_download and aw.medias) else (
+                        "failed" if should_download else "skipped"
+                    ),
+                    error=(
+                        (play_err or "未获取到视频直链")
+                        if (should_download and not aw.medias)
+                        else ""
+                    ),
+                )
+                new_records.append((rec, aw, bool(should_download and aw.medias)))
+
+        target_name = ""
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = error
+                if target_kind == "creator":
+                    if author_name and not t.nickname:
+                        t.nickname = author_name
+                    if author_avatar and not t.avatar:
+                        t.avatar = author_avatar
+                target_name = t.nickname or t.keyword or t.sec_uid
+                s.add(t)
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        dl_cookies = bili_cookie_map(state) if state else None
+        for rec, aw, should_download in new_records:
+            if not should_download:
+                continue
+            ok, path, dl_err = await self.downloader.download_aweme(
+                aw,
+                base_dir,
+                self._dl_proxy(proxy),
+                user_agent=ua,
+                cookies=dl_cookies,
+                referer=aw.source_url or "https://www.bilibili.com/",
+            )
+            with get_session() as s:
+                r = s.get(ContentRecord, rec.id)
+                if r:
+                    r.download_status = "done" if ok else "failed"
+                    r.local_path = path
+                    r.error = dl_err
+                    s.add(r)
+                    s.commit()
+
+        if not first_scan and new_records:
+            await self._notify_new_works(target_name, [aw for _, aw, _ in new_records])
+        return {
+            "ok": not error,
+            "new": len(new_records),
+            "new_works": len(new_records),
+            "scanned": len(candidates),
+            "filtered": filtered_count,
+            "backfill_count": backfill_count,
+            "error": error,
+        }
+
+    async def _scan_instagram_target_locked(self, target_id: int) -> dict:
+        with get_session() as s:
+            target = s.get(MonitorTarget, target_id)
+            if not target:
+                return {"ok": False, "error": "target not found"}
+            first_scan = target.last_scan_at is None
+            if not target.account_id:
+                return self._mark_target_skip(
+                    target_id, "Instagram 作品监控必须绑定已登录的 Instagram 账号"
+                )
+            acc = s.get(DouyinAccount, target.account_id)
+            if not acc or acc.platform != "instagram" or acc.status != "active":
+                return self._mark_target_skip(
+                    target_id, "绑定的 Instagram 账号不存在或登录态已失效，请重新绑定/登录"
+                )
+            if self._proxy_bad(acc):
+                return self._mark_target_skip(
+                    target_id, "账号代理标记为不可用(proxy bad)，已跳过以免暴露真实 IP"
+                )
+            identity = (
+                self.browser.identity_for(acc)
+                if callable(getattr(self.browser, "identity_for", None))
+                else None
+            )
+            proxy = acc.proxy or ""
+            state = acc.storage_state or acc.creator_storage_state or acc.cookie or ""
+            ua = acc.ua or self.cfg.engine.user_agent
+            account_seed = (
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else (acc.fp_seed or acc.profile_dir or "")
+            )
+            tz_id = (
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else (acc.timezone_id or "Asia/Shanghai")
+            )
+            known = set(
+                s.exec(select(ContentRecord.aweme_id).where(ContentRecord.target_id == target_id)).all()
+            )
+            known_create_times = list(
+                s.exec(select(ContentRecord.create_time).where(ContentRecord.target_id == target_id)).all()
+            )
+            target_kind = target.target_kind or "creator"
+            sec_uid = (target.sec_uid or "").strip()
+            keyword = (target.keyword or "").strip()
+            base_dir = target.download_dir or get_setting("download_dir", self.cfg.engine.media_dir)
+            monitor_since = int(target.created_at.timestamp())
+            scan_since = _douyin_scan_since(monitor_since, known_create_times)
+            backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
+            auto_download = target.download_enabled
+            media_filter = target.media_filter or "all"
+            strategy = _monitor_strategy(target, default_scrolls=4, default_items=0)
+
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=account_seed,
+            timezone_id=tz_id,
+        )
+        raw_items: list[dict] = []
+        author_name = ""
+        author_avatar = ""
+        error = ""
+
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                max_pages = max(1, min(6, strategy["max_scrolls"] or 2))
+                if target_kind == "keyword":
+                    raw_items, error = await icli.search_posts(keyword, max_pages=max_pages)
+                else:
+                    cursor = ""
+                    for _ in range(max_pages):
+                        batch, next_cursor, more, err = await icli.fetch_user_feed(
+                            sec_uid, max_id=cursor
+                        )
+                        if err:
+                            error = err
+                            break
+                        raw_items.extend(batch)
+                        if (
+                            not more
+                            or not next_cursor
+                            or next_cursor == cursor
+                            or (
+                                known
+                                and batch
+                                and all(
+                                    (parse_ig_aweme(r, require_media=False) is not None)
+                                    and parse_ig_aweme(r, require_media=False).aweme_id in known  # type: ignore[union-attr]
+                                    for r in batch
+                                )
+                            )
+                        ):
+                            break
+                        cursor = next_cursor
+
+            auth_failed = classify_platform_error(error)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not raw_items and error and not auth_failed)
+            ) and identity is not None:
+                scrolls = max(1, min(4, strategy["max_scrolls"] or 2))
+                if target_kind == "keyword":
+                    b_items, b_err = await fetch_ig_search(
+                        self.browser, identity, keyword, max_scrolls=scrolls
+                    )
+                    if b_items:
+                        raw_items, error = b_items, ""
+                    elif mode == "browser":
+                        error = b_err
+                else:
+                    b_items, b_author, b_err = await fetch_ig_posts(
+                        self.browser, identity, sec_uid, known, max_scrolls=scrolls
+                    )
+                    if b_items:
+                        raw_items, error = b_items, ""
+                        if isinstance(b_author, dict):
+                            author_name = str(b_author.get("nickname") or author_name)
+                            author_avatar = str(b_author.get("avatar") or author_avatar)
+                    elif mode == "browser":
+                        error = b_err
+
+            candidates: list[Aweme] = []
+            seen_ids: set[str] = set()
+            for r in raw_items:
+                aw = parse_ig_aweme(r, require_media=False)
+                if aw is None or aw.aweme_id in known or aw.aweme_id in seen_ids:
+                    continue
+                seen_ids.add(aw.aweme_id)
+                if aw.author_name and not author_name and target_kind == "creator":
+                    author_name = aw.author_name
+                if aw.avatar and not author_avatar and target_kind == "creator":
+                    author_avatar = aw.avatar
+                candidates.append(aw)
+
+            candidates.sort(key=lambda a: int(a.create_time or 0), reverse=True)
+            if should_backfill:
+                if backfill_count == 0:
+                    candidates = [a for a in candidates if not a.create_time or a.create_time >= monitor_since]
+                elif backfill_count > 0:
+                    candidates = candidates[:backfill_count]
+            else:
+                candidates = [a for a in candidates if not a.create_time or a.create_time >= scan_since]
+
+            new_records = []
+            filtered_count = 0
+            for aw in candidates:
+                if not _monitor_content_matches(aw, strategy):
+                    filtered_count += 1
+                    continue
+                if strategy["max_items"] and len(new_records) >= strategy["max_items"]:
+                    break
+                should_download = auto_download and (
+                    media_filter == "all" or aw.media_type == media_filter
+                )
+                media_err = ""
+                if should_download and not aw.medias:
+                    full_aw, _raw_m, media_err = await icli.fetch_media_info(aw.aweme_id)
+                    if full_aw is not None and full_aw.medias:
+                        aw = full_aw
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                    }
+                    for m in aw.medias
+                ])
+                rec = ContentRecord(
+                    platform="instagram",
+                    target_id=target_id,
+                    aweme_id=aw.aweme_id,
+                    desc=aw.desc,
+                    media_type=aw.media_type,
+                    quality=aw.quality_label,
+                    create_time=aw.create_time,
+                    cover_url=aw.cover or "",
+                    like_count=aw.like_count,
+                    comment_count=aw.comment_count,
+                    duration=aw.duration,
+                    media_json=media_json,
+                    download_status="pending" if (should_download and aw.medias) else (
+                        "failed" if should_download else "skipped"
+                    ),
+                    error=(
+                        (media_err or "未获取到 Instagram 媒体直链")
+                        if (should_download and not aw.medias)
+                        else ""
+                    ),
+                )
+                new_records.append((rec, aw, bool(should_download and aw.medias)))
+
+        target_name = ""
+        with get_session() as s:
+            for rec, _, _ in new_records:
+                s.add(rec)
+            t = s.get(MonitorTarget, target_id)
+            if t:
+                t.last_scan_at = datetime.utcnow()
+                t.last_error = error
+                if target_kind == "creator":
+                    if author_name and not t.nickname:
+                        t.nickname = author_name
+                    if author_avatar and not t.avatar:
+                        t.avatar = author_avatar
+                target_name = t.nickname or t.keyword or t.sec_uid
+                s.add(t)
+            s.commit()
+            for rec, _, _ in new_records:
+                s.refresh(rec)
+
+        for rec, aw, should_download in new_records:
+            if not should_download:
+                continue
+            ok, path, dl_err = await self.downloader.download_aweme(
+                aw,
+                base_dir,
+                self._dl_proxy(proxy),
+                user_agent=ua,
+                referer="https://www.instagram.com/",
+            )
+            with get_session() as s:
+                r = s.get(ContentRecord, rec.id)
+                if r:
+                    r.download_status = "done" if ok else "failed"
+                    r.local_path = path
+                    r.error = dl_err
+                    s.add(r)
+                    s.commit()
+
+        if not first_scan and new_records:
+            await self._notify_new_works(target_name, [aw for _, aw, _ in new_records])
+        return {
+            "ok": not error,
+            "new": len(new_records),
+            "new_works": len(new_records),
+            "scanned": len(candidates),
+            "filtered": filtered_count,
+            "backfill_count": backfill_count,
+            "error": error,
+        }
+
     async def _scan_target_locked(self, target_id: int) -> dict:
         with get_session() as s:
             t0 = s.get(MonitorTarget, target_id)
@@ -1742,6 +2320,10 @@ class MonitorEngine:
             return await self._scan_tiktok_target_locked(target_id)
         if platform == "shipinhao":
             return await self._scan_channels_target_locked(target_id)
+        if platform == "bilibili":
+            return await self._scan_bilibili_target_locked(target_id)
+        if platform == "instagram":
+            return await self._scan_instagram_target_locked(target_id)
         with get_session() as s:
             target = s.get(MonitorTarget, target_id)
             if not target:
@@ -1774,6 +2356,7 @@ class MonitorEngine:
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
             backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
             auto_download = target.download_enabled
             media_filter = target.media_filter or "all"
             strategy = _monitor_strategy(
@@ -1784,11 +2367,11 @@ class MonitorEngine:
             max_scrolls=strategy["max_scrolls"],
             block_media=self.cfg.engine.block_media_resources,
             # 默认只监控订阅后的作品；显式首次回填时允许继续向历史翻页。
-            stop_before=(0 if first_scan and backfill_count != 0 else scan_since))
+            stop_before=(0 if should_backfill and backfill_count != 0 else scan_since))
 
         new_records = []
         selected = _select_douyin_awemes(
-            items, quality, first_scan, scan_since, backfill_count)
+            items, quality, should_backfill, scan_since, backfill_count)
         filtered_count = 0
         for aw in selected:
             if not _monitor_content_matches(aw, strategy):
@@ -1830,14 +2413,15 @@ class MonitorEngine:
             for rec, _, _ in new_records:
                 s.refresh(rec)
 
-        if new_records and not first_scan:
+        if new_records and not should_backfill:
             await self._notify_new(target_name, [aw for _, aw, _ in new_records])
 
         await asyncio.gather(*(self._download(rec.id, aw, base_dir, proxy)
                                for rec, aw, should_download in new_records
                                if should_download))
         return {"ok": not error, "new": len(new_records), "error": error,
-                "scanned": len(selected), "filtered": filtered_count}
+                "scanned": len(selected), "filtered": filtered_count,
+                "backfill_count": backfill_count}
 
     # ── 快手:创作者作品监控(浏览器拦截 GraphQL,与抖音同范式)──
     async def _scan_ks_target_locked(self, target_id: int) -> dict:
@@ -1846,7 +2430,11 @@ class MonitorEngine:
             if not target:
                 return {"ok": False, "error": "target not found"}
             first_scan = target.last_scan_at is None
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             proxy = ""
             if target.account_id:
                 acc = s.get(DouyinAccount, target.account_id)
@@ -1868,6 +2456,7 @@ class MonitorEngine:
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
             backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
             auto_download = target.download_enabled
             media_filter = target.media_filter or "all"
             strategy = _monitor_strategy(
@@ -1878,10 +2467,10 @@ class MonitorEngine:
             max_scrolls=strategy["max_scrolls"],
             block_media=self.cfg.engine.block_media_resources,
             # 默认只监控订阅后的作品；显式首次回填时允许继续向历史翻页。
-            stop_before=(0 if first_scan and backfill_count != 0 else scan_since))
+            stop_before=(0 if should_backfill and backfill_count != 0 else scan_since))
 
         selected = _select_ks_awemes(
-            items, quality, first_scan, scan_since, backfill_count)
+            items, quality, should_backfill, scan_since, backfill_count)
         new_records = []
         filtered_count = 0
         for aw in selected:
@@ -1924,14 +2513,15 @@ class MonitorEngine:
             for rec, _, _ in new_records:
                 s.refresh(rec)
 
-        if new_records and not first_scan:
+        if new_records and not should_backfill:
             await self._notify_new(target_name, [aw for _, aw, _ in new_records])
 
         await asyncio.gather(*(self._download(rec.id, aw, base_dir, proxy)
                                for rec, aw, should_download in new_records
                                if should_download))
         return {"ok": not error, "new": len(new_records), "error": error,
-                "scanned": len(selected), "filtered": filtered_count}
+                "scanned": len(selected), "filtered": filtered_count,
+                "backfill_count": backfill_count}
 
     async def _scan_tiktok_target_locked(self, target_id: int) -> dict:
         with get_session() as s:
@@ -1964,6 +2554,7 @@ class MonitorEngine:
             monitor_since = int(target.created_at.timestamp())
             scan_since = _douyin_scan_since(monitor_since, known_create_times)
             backfill_count = target.initial_backfill_count
+            should_backfill = first_scan or (backfill_count != 0 and not known)
             auto_download = target.download_enabled
             media_filter = target.media_filter or "all"
             strategy = _monitor_strategy(target, default_scrolls=12, default_items=0)
@@ -1976,7 +2567,7 @@ class MonitorEngine:
             max_scrolls=strategy["max_scrolls"],
             block_media=self.cfg.engine.block_media_resources)
         selected = _select_tiktok_awemes(
-            items, quality, first_scan, scan_since, backfill_count)
+            items, quality, should_backfill, scan_since, backfill_count)
         new_records = []
         filtered_count = 0
         for aw in selected:
@@ -2027,7 +2618,7 @@ class MonitorEngine:
             for rec, _, _ in new_records:
                 s.refresh(rec)
 
-        if new_records and not first_scan:
+        if new_records and not should_backfill:
             await self._notify_new(target_name, [aw for _, aw, _ in new_records])
         await asyncio.gather(*(self._download(
             rec.id, aw, base_dir, proxy, user_agent=download_ua,
@@ -2035,7 +2626,8 @@ class MonitorEngine:
             referer=aw.source_url or tiktok_profile_url(unique_id))
             for rec, aw, should_download in new_records if should_download))
         return {"ok": not error, "new": len(new_records), "error": error,
-                "scanned": len(selected), "filtered": filtered_count}
+                "scanned": len(selected), "filtered": filtered_count,
+                "backfill_count": backfill_count}
 
     # ── 视频号:创作者主页作品监控(优先微信 Finder 本地 CDP 协议 + WxIsaac64 解密下载)──
     async def _scan_channels_target_locked(self, target_id: int) -> dict:
@@ -2044,7 +2636,11 @@ class MonitorEngine:
             if not target:
                 return {"ok": False, "error": "target not found"}
             is_first_scan = target.last_scan_at is None
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             proxy = ""
             acc_sec_uid = ""
             has_active_account = False
@@ -2211,7 +2807,11 @@ class MonitorEngine:
             xsec_token = target.xsec_token or ""
             state = ""
             proxy = ""
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             if target.account_id:
                 acc = s.get(DouyinAccount, target.account_id)
                 if acc:
@@ -2220,7 +2820,11 @@ class MonitorEngine:
                             target_id, "账号代理标记为不可用(proxy bad),已跳过以免暴露真实 IP")
                     state = acc.storage_state or ""
                     proxy = acc.proxy or ""
-                    identity = self.browser.identity_for(acc)
+                    identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
             known = set(s.exec(
                 select(ContentRecord.aweme_id)
                 .where(ContentRecord.target_id == target_id)).all())
@@ -2514,25 +3118,68 @@ class MonitorEngine:
                     acc = s.get(DouyinAccount, account_id)
                     if not acc:
                         return {"ok": False, "error": "账号不存在"}
-                    if platform != "douyin":
-                        return {"ok": False, "error": "当前仅支持抖音短视频弹幕"}
-                    transport = resolve_transport(
-                        self.cfg, "douyin", "creator_danmaku", acc)
-                    if transport["effective_mode"] == "unavailable":
-                        return {"ok": False, "error": transport["reason"],
-                                "configured_mode": transport["configured_mode"]}
-                    mode = transport["effective_mode"]
-                    if mode == "browser" and not acc.creator_storage_state:
-                        return {"ok": False, "error": "需要先完成抖音创作者登录"}
-                    state = acc.storage_state or acc.creator_storage_state or ""
-                    identity = (None if mode == "api"
-                                else self.browser.identity_for(acc))
-                    ua = acc.ua or self.cfg.engine.user_agent
-                    proxy = acc.proxy or ""
-                    direct_environment = douyin_client_environment(acc)
-                    known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
-                        DanmakuRecord.watch_id == 0,
-                        DanmakuRecord.aweme_id == item_id)).all())
+                    if platform == "bilibili":
+                        bstate = acc.storage_state or acc.cookie or ""
+                        bua = acc.ua or self.cfg.engine.user_agent
+                        bproxy = acc.proxy or ""
+                        known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
+                            DanmakuRecord.watch_id == 0,
+                            DanmakuRecord.aweme_id == item_id)).all())
+                    elif platform != "douyin":
+                        return {"ok": False, "error": "当前仅支持抖音与哔哩哔哩弹幕"}
+                    else:
+                        transport = resolve_transport(
+                            self.cfg, "douyin", "creator_danmaku", acc)
+                        if transport["effective_mode"] == "unavailable":
+                            return {"ok": False, "error": transport["reason"],
+                                    "configured_mode": transport["configured_mode"]}
+                        mode = transport["effective_mode"]
+                        if mode == "browser" and not acc.creator_storage_state:
+                            return {"ok": False, "error": "需要先完成抖音创作者登录"}
+                        state = acc.storage_state or acc.creator_storage_state or ""
+                        identity = (None if mode == "api"
+                                    else self.browser.identity_for(acc))
+                        ua = acc.ua or self.cfg.engine.user_agent
+                        proxy = acc.proxy or ""
+                        direct_environment = douyin_client_environment(acc)
+                        known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
+                            DanmakuRecord.watch_id == 0,
+                            DanmakuRecord.aweme_id == item_id)).all())
+                if platform == "bilibili":
+                    bcli = BilibiliClient(
+                        bstate, bua, proxy=bproxy, timeout=self.cfg.engine.request_timeout_seconds
+                    )
+                    async with bcli.session_scope():
+                        fresh, err = await bcli.fetch_danmaku(item_id)
+                    added = 0
+                    with get_session() as s:
+                        for item in fresh:
+                            did = item.get("danmaku_id") or ""
+                            if not did or did in known:
+                                continue
+                            known.add(did)
+                            s.add(DanmakuRecord(
+                                platform="bilibili",
+                                watch_id=0,
+                                aweme_id=item_id,
+                                source="public",
+                                **{k: v for k, v in item.items() if k != "aweme_id"},
+                            ))
+                            added += 1
+                        s.commit()
+                    result = {
+                        "ok": bool(added or not err),
+                        "fetched": len(fresh),
+                        "added": added,
+                        "error": err,
+                        "source": "api",
+                        "configured_mode": str(getattr(self.cfg.engine, "bilibili_read_mode", "hybrid")),
+                    }
+                    if result["ok"]:
+                        self.risk.record_success(account_id, OperationKind.READ_HEAVY)
+                    elif err:
+                        self.risk.record_failure(account_id, OperationKind.READ_HEAVY, err)
+                    return result
                 raw, err = [], ""
                 source = "api" if mode == "api" else "browser"
                 if mode in {"api", "hybrid"}:
@@ -2621,6 +3268,8 @@ class MonitorEngine:
             watch = s.get(DanmakuWatch, watch_id)
             if not watch:
                 return {"ok": False, "error": "watch not found"}
+            if watch.platform == "bilibili":
+                return await self._scan_bilibili_danmaku_watch_locked(watch_id)
             first_scan = watch.last_scan_at is None
             kind, mode = watch.kind, watch.mode
             aweme_id, sec_uid = watch.aweme_id, watch.sec_uid
@@ -2651,9 +3300,17 @@ class MonitorEngine:
                         self.cfg, "douyin", "creator_danmaku", acc)["effective_mode"]
                         if mode == "creator" else self.cfg.engine.douyin_read_mode)
                     if account_mode != "api":
-                        identity = self.browser.identity_for(acc)
+                        identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
             if identity is None and not watch.account_id:
-                identity = self.browser.anon_identity()
+                identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
 
         if mode == "creator" and watch.account_id:
             creator_transport = resolve_transport(
@@ -2948,10 +3605,123 @@ class MonitorEngine:
         return {"ok": not error or total_new > 0,
                 "new_danmaku": total_new, "error": error}
 
+    async def _scan_bilibili_danmaku_watch_locked(self, watch_id: int) -> dict:
+        with get_session() as s:
+            watch = s.get(DanmakuWatch, watch_id)
+            if not watch:
+                return {"ok": False, "error": "watch not found"}
+            first_scan = watch.last_scan_at is None
+            kind = watch.kind
+            aweme_id, sec_uid = watch.aweme_id, watch.sec_uid
+            name = watch.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
+            state = ""
+            ua = self.cfg.engine.user_agent
+            proxy = ""
+            if watch.account_id:
+                acc = s.get(DouyinAccount, watch.account_id)
+                if acc:
+                    if self._proxy_bad(acc):
+                        msg = "账号代理标记为不可用(proxy bad),已跳过"
+                        watch.last_scan_at = datetime.utcnow()
+                        watch.last_error = msg
+                        s.add(watch)
+                        s.commit()
+                        return {"ok": False, "new_danmaku": 0, "error": msg, "skipped": True}
+                    state = acc.storage_state or acc.cookie or ""
+                    ua = acc.ua or self.cfg.engine.user_agent
+                    proxy = acc.proxy or ""
+            settings = {
+                "recent_works": watch.recent_works or self.cfg.engine.danmaku_recent_works,
+                "recent_days": watch.recent_days or self.cfg.engine.danmaku_recent_days,
+                "time_start_ms": max(0, watch.time_start_ms or 0),
+                "time_end_ms": max(0, watch.time_end_ms or 0),
+                "include_keywords": [str(x).strip() for x in _loads_list(watch.include_keywords) if str(x).strip()],
+                "exclude_keywords": [str(x).strip() for x in _loads_list(watch.exclude_keywords) if str(x).strip()],
+                "min_text_length": max(0, watch.min_text_length or 0),
+                "max_text_length": max(0, watch.max_text_length or 0),
+                "min_like_count": max(0, watch.min_like_count or 0),
+                "max_records_per_scan": watch.max_records_per_scan or self.cfg.engine.danmaku_max_records_per_scan,
+                "max_records_total": watch.max_records_total or self.cfg.engine.danmaku_max_records_total,
+            }
+
+        bcli = BilibiliClient(
+            state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+        )
+        total_new = 0
+        error = ""
+        remaining = settings["max_records_per_scan"] if settings["max_records_per_scan"] > 0 else None
+
+        try:
+            async with bcli.session_scope():
+                target_videos: list[tuple[str, str]] = []
+                if kind == "video":
+                    target_videos.append((aweme_id, name))
+                else:
+                    vlist, _, verr = await bcli.fetch_user_videos(sec_uid, pn=1, ps=30)
+                    if verr:
+                        error = verr
+                    cutoff = int(time.time()) - settings["recent_days"] * 86400
+                    for v in vlist:
+                        bv = str(v.get("bvid") or "")
+                        ct = int(v.get("created") or v.get("pubdate") or 0)
+                        if bv and (not cutoff or not ct or ct >= cutoff):
+                            target_videos.append((bv, str(v.get("title") or "")))
+                        if len(target_videos) >= settings["recent_works"]:
+                            break
+
+                for bv, vtitle in target_videos:
+                    if remaining is not None and remaining <= 0:
+                        break
+                    with get_session() as s:
+                        known = set(
+                            s.exec(
+                                select(DanmakuRecord.danmaku_id).where(
+                                    DanmakuRecord.watch_id == watch_id,
+                                    DanmakuRecord.aweme_id == bv,
+                                )
+                            ).all()
+                        )
+                    rows, derr = await bcli.fetch_danmaku(bv)
+                    if derr and not error:
+                        error = derr
+                    filtered = [
+                        r for r in rows
+                        if r.get("danmaku_id") not in known and _danmaku_matches(r, settings)
+                    ]
+                    if remaining is not None:
+                        filtered = filtered[:remaining]
+                        remaining -= len(filtered)
+                    total_new += await self._ingest_danmaku(
+                        watch_id,
+                        bv,
+                        filtered,
+                        name,
+                        vtitle or bv,
+                        first_scan,
+                        "public",
+                        max_records_total=settings["max_records_total"],
+                        platform="bilibili",
+                    )
+        except Exception as exc:
+            error = repr(exc)
+
+        with get_session() as s:
+            watch = s.get(DanmakuWatch, watch_id)
+            if watch:
+                watch.last_scan_at = datetime.utcnow()
+                watch.last_error = error
+                watch.danmaku_count = len(
+                    s.exec(select(DanmakuRecord.id).where(DanmakuRecord.watch_id == watch_id)).all()
+                )
+                s.add(watch)
+                s.commit()
+        return {"ok": not error or total_new > 0, "new_danmaku": total_new, "error": error}
+
     async def _ingest_danmaku(self, watch_id: int, aweme_id: str, fresh: list,
                               name: str, work_desc: str, first_scan: bool,
                               source: str = "public",
-                              max_records_total: int = 0) -> int:
+                              max_records_total: int = 0,
+                              platform: str = "douyin") -> int:
         if not fresh and max_records_total <= 0:
             return 0
         added = []
@@ -2969,7 +3739,7 @@ class MonitorEngine:
                     continue
                 row = dict(item)
                 row.pop("aweme_id", None)
-                s.add(DanmakuRecord(platform="douyin", watch_id=watch_id,
+                s.add(DanmakuRecord(platform=platform, watch_id=watch_id,
                                     aweme_id=aid, source=source, **row))
                 added.append(dict(item, aweme_id=aid))
             if max_records_total > 0:
@@ -3000,7 +3770,7 @@ class MonitorEngine:
     async def sync_work_comments(self, account_id: int, platform: str, item_id: str,
                                  xsec_token: str = "") -> dict:
         """抓「本账号某作品」的评论并落库(watch_id=0 标记本账号来源)。
-        抖音直连(comment/list 分页 + 回复,参考 CommentAll),小红书走签名直连客户端,
+        抖音直连(comment/list 分页 + 回复),小红书走签名直连客户端,
         快手走浏览器拦截。返回 {ok, fetched, added, error}。"""
         key = f"wc:{account_id}:{item_id}"
         if key in self._inflight:
@@ -3182,6 +3952,101 @@ class MonitorEngine:
                 error = err or ""
                 fresh = [c for c in (parse_tiktok_comment(rc) for rc in raw)
                          if c and c["comment_id"] not in known]
+            elif platform == "bilibili":
+                configured_mode = str(
+                    getattr(self.cfg.engine, "bilibili_read_mode", "hybrid") or "hybrid"
+                ).lower()
+                bcli = BilibiliClient(
+                    state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+                )
+                collected: list[dict] = []
+                api_err = ""
+                if configured_mode in {"api", "hybrid"}:
+                    async with bcli.session_scope():
+                        up_rows, _, up_err = await bcli.fetch_up_fulllist_comments(
+                            bvid=item_id, pn=1, ps=50
+                        )
+                        for r in up_rows:
+                            row_copy = dict(r)
+                            row_copy.pop("aweme_id", None)
+                            collected.append(row_copy)
+                        pub_rows, pub_err = await bcli.fetch_comments(
+                            item_id, max_count=200, include_replies=True
+                        )
+                        collected.extend(pub_rows)
+                        api_err = pub_err if (not collected and pub_err) else (up_err if not collected else "")
+                    if not api_err or collected:
+                        source = "api"
+                if configured_mode == "browser" or (
+                    configured_mode == "hybrid" and not collected and api_err and identity is not None
+                ):
+                    b_rows, b_err = await fetch_bili_comments(
+                        self.browser, identity, item_id, max_count=200
+                    )
+                    source = "browser_fallback" if configured_mode == "hybrid" else "browser"
+                    if b_rows:
+                        collected = b_rows
+                        error = ""
+                    else:
+                        error = b_err or api_err
+                else:
+                    error = api_err
+                dedup: dict[str, dict] = {}
+                for c in collected:
+                    cid = c.get("comment_id")
+                    if cid and cid not in known and cid not in dedup:
+                        dedup[cid] = c
+                fresh = list(dedup.values())
+            elif platform == "instagram":
+                configured_mode = str(
+                    getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid"
+                ).lower()
+                icli = InstagramClient(
+                    state,
+                    ua,
+                    proxy=proxy,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    account_seed=(
+                        (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                        if identity is not None
+                        else ""
+                    ),
+                    timezone_id=(
+                        getattr(identity, "timezone_id", "Asia/Shanghai")
+                        if identity is not None
+                        else "Asia/Shanghai"
+                    ),
+                )
+                collected_ig: list[dict] = []
+                api_err = ""
+                if configured_mode in {"api", "hybrid"}:
+                    async with icli.session_scope():
+                        collected_ig, api_err = await icli.fetch_comments(
+                            item_id, max_count=200, include_replies=True
+                        )
+                    if not api_err or collected_ig:
+                        source = "api"
+                auth_failed = classify_platform_error(api_err)[0] == RiskCategory.AUTH
+                if configured_mode == "browser" or (
+                    configured_mode == "hybrid" and not collected_ig and api_err and not auth_failed and identity is not None
+                ):
+                    ig_rows, ig_err = await fetch_ig_comments(
+                        self.browser, identity, item_id, max_count=200
+                    )
+                    source = "browser_fallback" if configured_mode == "hybrid" else "browser"
+                    if ig_rows:
+                        collected_ig = ig_rows
+                        error = ""
+                    else:
+                        error = ig_err or api_err
+                else:
+                    error = api_err
+                dedup_ig: dict[str, dict] = {}
+                for c in collected_ig:
+                    cid = c.get("comment_id")
+                    if cid and cid not in known and cid not in dedup_ig:
+                        dedup_ig[cid] = c
+                fresh = list(dedup_ig.values())
             else:
                 return {"ok": False, "fetched": 0, "added": 0,
                         "error": f"不支持的平台:{platform}",
@@ -3307,12 +4172,17 @@ class MonitorEngine:
             platform = w.platform
             kind, mode = w.kind, w.mode
             aweme_id, sec_uid = w.aweme_id, w.sec_uid
+            work_url = w.work_url
             xsec_token = w.xsec_token or ""
             xsec_source = w.xsec_source or ""
             name = w.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
             state = creator_state = proxy = ""
             ua = self.cfg.engine.user_agent
-            identity = self.browser.anon_identity()
+            identity = (
+                self.browser.anon_identity()
+                if callable(getattr(self.browser, "anon_identity", None))
+                else None
+            )
             has_creator = False
             if w.account_id:
                 acc = s.get(DouyinAccount, w.account_id)
@@ -3345,7 +4215,11 @@ class MonitorEngine:
                     ua = acc.ua or self.cfg.engine.user_agent
                     proxy = acc.proxy or ""
                     has_creator = bool(creator_state)
-                    identity = self.browser.identity_for(acc)
+                    identity = (
+                        self.browser.identity_for(acc)
+                        if callable(getattr(self.browser, "identity_for", None))
+                        else None
+                    )
                 elif platform == "tiktok":
                     msg = "绑定的 TikTok 账号不存在或登录态已失效"
                     w.last_scan_at = datetime.utcnow()
@@ -3358,6 +4232,14 @@ class MonitorEngine:
                 w.last_error = msg
                 s.add(w); s.commit()
                 return {"ok": False, "new_comments": 0, "error": msg}
+            if platform == "instagram":
+                acc_ig = s.get(DouyinAccount, w.account_id) if w.account_id else None
+                if not w.account_id or not acc_ig or acc_ig.platform != "instagram" or acc_ig.status != "active" or not state:
+                    msg = "Instagram 评论监控必须绑定已登录且状态正常的 Instagram 账号"
+                    w.last_scan_at = datetime.utcnow()
+                    w.last_error = msg
+                    s.add(w); s.commit()
+                    return {"ok": False, "new_comments": 0, "error": msg}
 
         # 公开抖音读取可复用一个带 Cookie 的 Web API 会话；创作中心仍由
         # 浏览器处理。没有登录态时 hybrid 继续允许匿名浏览器回退。
@@ -3412,6 +4294,18 @@ class MonitorEngine:
             elif platform == "shipinhao":
                 total_new, author = await self._cw_channels_video(
                     watch_id, identity, state, aweme_id, xsec_token, name, first_scan)
+            elif platform == "bilibili" and kind == "user":
+                total_new, author = await self._cw_bilibili_user(
+                    watch_id, identity, state, ua, proxy, sec_uid, name, first_scan)
+            elif platform == "bilibili":
+                total_new, author = await self._cw_bilibili_video(
+                    watch_id, identity, state, ua, proxy, aweme_id, name, first_scan)
+            elif platform == "instagram" and kind == "user":
+                total_new, author = await self._cw_instagram_user(
+                    watch_id, identity, state, ua, proxy, sec_uid, name, first_scan)
+            elif platform == "instagram":
+                total_new, author = await self._cw_instagram_video(
+                    watch_id, identity, state, ua, proxy, aweme_id, name, first_scan, work_url=work_url)
             elif kind == "user" and mode == "creator":
                 total_new, author = await self._cw_creator(watch_id, identity, has_creator,
                                                            name, first_scan)
@@ -3438,11 +4332,14 @@ class MonitorEngine:
                 w.last_scan_at = datetime.utcnow()
                 w.last_error = str(error or "")
                 if author:
-                    if not w.title:
+                    if (
+                        not w.title
+                        or (w.platform == "instagram" and w.title.startswith("IG "))
+                    ):
                         w.title = author.get("nickname") or w.title
-                    if not w.avatar:
-                        ava = (author.get("avatar_thumb") or {}).get("url_list") or []
-                        w.avatar = ava[0] if ava else w.avatar
+                    ava = (author.get("avatar_thumb") or {}).get("url_list") or []
+                    if ava and ava[0] and (not w.avatar or w.platform == "instagram"):
+                        w.avatar = ava[0]
                 w.comment_count = len(s.exec(select(CommentRecord.id)
                                              .where(CommentRecord.watch_id == watch_id)).all())
                 s.add(w); s.commit()
@@ -3517,7 +4414,7 @@ class MonitorEngine:
         return title
 
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
-                      platform="douyin", *, work_url="") -> int:
+                      platform="douyin", *, work_url="", update_watch_title=True) -> int:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
         from ..comment_ai import clean_work_title, enqueue
 
@@ -3530,7 +4427,7 @@ class MonitorEngine:
                     CommentRecord.watch_id == watch_id, CommentRecord.platform == platform,
                     CommentRecord.aweme_id == aweme_id, CommentRecord.work_url != work_url,
                 ).values(work_url=work_url))
-            if work_desc:
+            if work_desc and update_watch_title:
                 watch = s.get(CommentWatch, watch_id)
                 if (watch and watch.kind == "video" and watch.aweme_id == aweme_id
                         and watch.platform == platform and watch.title != work_desc):
@@ -4144,6 +5041,288 @@ class MonitorEngine:
                         "avatar_thumb": {"url_list": [author_dict["avatar"]]}}
                        if author_dict else None)
 
+    async def _cw_bilibili_video(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        work_id: str, name: str, first_scan: bool
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        work_desc = self._comment_work_title("bilibili", work_id, name)
+        work_url = bili_work_url(work_id)
+        target = work_url if work_id.isdigit() else work_id
+        metadata = {}
+        with get_session() as s:
+            known = set(
+                s.exec(
+                    select(CommentRecord.comment_id)
+                    .where(CommentRecord.watch_id == watch_id)
+                    .where(CommentRecord.aweme_id == work_id)
+                ).all()
+            )
+        mode = str(getattr(self.cfg.engine, "bilibili_read_mode", "hybrid") or "hybrid").lower()
+        max_c = max(30, int(settings["max_scrolls"] or 4) * 20)
+        rows: list[dict] = []
+        err = ""
+        author_dict = None
+        bcli = BilibiliClient(
+            state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+        )
+        async with bcli.session_scope():
+            if mode in {"api", "hybrid"}:
+                detail, _ = await bcli.fetch_video_detail(target)
+                aw = parse_bili_aweme(detail, require_media=False) if detail else None
+                if aw:
+                    work_desc = aw.desc or work_desc
+                    author_dict = {
+                        "nickname": aw.author_name,
+                        "avatar_thumb": {"url_list": [aw.avatar]},
+                    }
+                rows, err = await bcli.fetch_comments(target, max_count=max_c, include_replies=True)
+            if (mode == "browser" or (mode == "hybrid" and not rows and err)) and identity is not None:
+                b_rows, b_err = await fetch_bili_comments(
+                    self.browser, identity, work_id, max_count=max_c,
+                    work_metadata=None if work_desc else metadata,
+                )
+                if b_rows:
+                    rows, err = b_rows, ""
+                elif mode == "browser":
+                    err = b_err
+        if err and not rows:
+            raise RuntimeError(err)
+        fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+        total = await self._ingest(
+            watch_id, work_id, fresh, name, work_desc or metadata.get("title", ""), first_scan,
+            platform="bilibili", work_url=work_url,
+        )
+        return total, author_dict
+
+    async def _cw_bilibili_user(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        mid: str, name: str, first_scan: bool
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        mode = str(getattr(self.cfg.engine, "bilibili_read_mode", "hybrid") or "hybrid").lower()
+        bcli = BilibiliClient(
+            state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+        )
+        total = 0
+        author_dict = None
+        async with bcli.session_scope():
+            vlist, err = [], ""
+            if mode in {"api", "hybrid"}:
+                vlist, _, err = await bcli.fetch_user_videos(mid, pn=1, ps=50)
+            if (mode == "browser" or (mode == "hybrid" and not vlist and err)) and identity is not None:
+                browser_items, _, browser_error = await fetch_bili_videos(
+                    self.browser, identity, mid, max_scrolls=3,
+                )
+                if browser_items or mode == "browser":
+                    vlist, err = browser_items, browser_error
+            if err and not vlist:
+                raise RuntimeError(err)
+            cutoff = int(time.time()) - settings["recent_days"] * 86400
+            selected: list[tuple[str, str]] = []
+            for v in vlist:
+                if not author_dict and v.get("author"):
+                    author_dict = {"nickname": str(v["author"]), "avatar_thumb": {"url_list": []}}
+                bv = str(v.get("bvid") or "")
+                ct = int(v.get("created") or v.get("pubdate") or 0)
+                if bv and (not cutoff or not ct or ct >= cutoff):
+                    selected.append((bv, str(v.get("title") or "")))
+                if len(selected) >= settings["recent_works"]:
+                    break
+            max_c = max(20, int(settings["max_scrolls"] or 4) * 20)
+            for bv, vtitle in selected:
+                with get_session() as s:
+                    known = set(
+                        s.exec(
+                            select(CommentRecord.comment_id)
+                            .where(CommentRecord.watch_id == watch_id)
+                            .where(CommentRecord.aweme_id == bv)
+                        ).all()
+                    )
+                rows, comment_error = [], ""
+                if mode in {"api", "hybrid"}:
+                    rows, comment_error = await bcli.fetch_comments(bv, max_count=max_c, include_replies=True)
+                if (mode == "browser" or (mode == "hybrid" and not rows and comment_error)) and identity is not None:
+                    rows, _ = await fetch_bili_comments(self.browser, identity, bv, max_count=max_c)
+                fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+                total += await self._ingest(
+                    watch_id, bv, fresh, name, vtitle, first_scan,
+                    platform="bilibili", work_url=bili_work_url(bv),
+                )
+        return total, author_dict
+
+    async def _cw_instagram_video(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        work_id: str, name: str, first_scan: bool, *, work_url: str = "",
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        work_desc = self._comment_work_title("instagram", work_id)
+        metadata = {}
+        with get_session() as s:
+            known = set(
+                s.exec(
+                    select(CommentRecord.comment_id)
+                    .where(CommentRecord.watch_id == watch_id)
+                    .where(CommentRecord.aweme_id == work_id)
+                ).all()
+            )
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        max_c = max(30, int(settings["max_scrolls"] or 4) * 20)
+        rows: list[dict] = []
+        err = ""
+        author_dict = None
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=(
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else ""
+            ),
+            timezone_id=(
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else "Asia/Shanghai"
+            ),
+        )
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                aw_info, _raw_m, _ = await icli.fetch_media_info(work_id)
+                if aw_info is not None:
+                    if not work_url or work_url == ig_work_url(work_id):
+                        work_url = ig_work_url(work_id, aw_info.source_url)
+                    clean_desc = " ".join(str(aw_info.desc or "").split())[:36]
+                    if aw_info.author_name and clean_desc:
+                        display_title = f"{aw_info.author_name} · {clean_desc}"
+                    else:
+                        display_title = clean_desc or aw_info.author_name
+                    work_desc = aw_info.desc or work_desc
+                    author_dict = {
+                        "nickname": display_title,
+                        "avatar_thumb": {"url_list": [str(aw_info.avatar or aw_info.cover or "")]},
+                    }
+                rows, err = await icli.fetch_comments(work_id, max_count=max_c, include_replies=True)
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not rows and err and not auth_failed)
+            ) and identity is not None:
+                ig_rows, ig_err = await fetch_ig_comments(
+                    self.browser, identity, work_url or work_id, max_count=max_c,
+                    work_metadata=metadata,
+                )
+                if ig_rows:
+                    rows, err = ig_rows, ""
+                elif mode == "browser":
+                    err = ig_err
+        if err and not rows:
+            raise RuntimeError(err)
+        if not author_dict and metadata.get("title"):
+            author_dict = {"nickname": metadata["title"][:80]}
+        fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+        total = await self._ingest(
+            watch_id, work_id, fresh, name, metadata.get("title") or work_desc, first_scan,
+            platform="instagram", work_url=ig_work_url(work_id, metadata.get("url") or work_url),
+            update_watch_title=False,
+        )
+        return total, author_dict
+
+    async def _cw_instagram_user(
+        self, watch_id: int, identity, state: str, ua: str, proxy: str,
+        user_ref: str, name: str, first_scan: bool
+    ):
+        settings = self._comment_watch_settings(watch_id)
+        mode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+        icli = InstagramClient(
+            state,
+            ua,
+            proxy=proxy,
+            timeout=self.cfg.engine.request_timeout_seconds,
+            account_seed=(
+                (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                if identity is not None
+                else ""
+            ),
+            timezone_id=(
+                getattr(identity, "timezone_id", "Asia/Shanghai")
+                if identity is not None
+                else "Asia/Shanghai"
+            ),
+        )
+        total = 0
+        author_dict = None
+        raw_feed: list[dict] = []
+        err = ""
+        async with icli.session_scope():
+            if mode in {"api", "hybrid"}:
+                raw_feed, _next, _more, err = await icli.fetch_user_feed(user_ref)
+            auth_failed = classify_platform_error(err)[0] == RiskCategory.AUTH
+            if (
+                mode == "browser"
+                or (mode == "hybrid" and not raw_feed and err and not auth_failed)
+            ) and identity is not None:
+                b_items, b_author, b_err = await fetch_ig_posts(
+                    self.browser, identity, user_ref, set(), max_scrolls=3
+                )
+                if b_items:
+                    raw_feed, err = b_items, ""
+                    if isinstance(b_author, dict) and b_author.get("nickname"):
+                        author_dict = {
+                            "nickname": str(b_author["nickname"]),
+                            "avatar_thumb": {"url_list": [str(b_author.get("avatar") or "")]},
+                        }
+                elif mode == "browser":
+                    err = b_err
+            if err and not raw_feed:
+                raise RuntimeError(err)
+            cutoff = int(time.time()) - settings["recent_days"] * 86400
+            selected: list[Aweme] = []
+            for raw in raw_feed:
+                aw = parse_ig_aweme(raw, require_media=False)
+                if aw is None:
+                    continue
+                if not author_dict and aw.author_name:
+                    author_dict = {
+                        "nickname": str(aw.author_name),
+                        "avatar_thumb": {"url_list": [str(aw.avatar or "")]},
+                    }
+                if not cutoff or not aw.create_time or aw.create_time >= cutoff:
+                    selected.append(aw)
+                if len(selected) >= settings["recent_works"]:
+                    break
+            max_c = max(20, int(settings["max_scrolls"] or 4) * 20)
+            for aw in selected:
+                code = aw.aweme_id
+                with get_session() as s:
+                    known = set(
+                        s.exec(
+                            select(CommentRecord.comment_id)
+                            .where(CommentRecord.watch_id == watch_id)
+                            .where(CommentRecord.aweme_id == code)
+                        ).all()
+                    )
+                rows: list[dict] = []
+                c_err = ""
+                if mode in {"api", "hybrid"}:
+                    rows, c_err = await icli.fetch_comments(code, max_count=max_c, include_replies=True)
+                if (
+                    mode == "browser"
+                    or (mode == "hybrid" and not rows and c_err)
+                ) and identity is not None:
+                    b_rows, _ = await fetch_ig_comments(
+                        self.browser, identity, ig_work_url(code, aw.source_url) or code, max_count=max_c
+                    )
+                    if b_rows:
+                        rows = b_rows
+                fresh = [c for c in rows if c and c.get("comment_id") and c["comment_id"] not in known]
+                total += await self._ingest(
+                    watch_id, code, fresh, name, aw.desc, first_scan,
+                    platform="instagram", work_url=ig_work_url(code, aw.source_url),
+                )
+        return total, author_dict
+
     # ── 发布(小红书创作平台)+ 跨平台转发 ──
     def _content_files(self, rec: ContentRecord) -> list:
         """收集一条作品记录在本地的媒体文件路径。"""
@@ -4195,11 +5374,15 @@ class MonitorEngine:
                         or len(set(media_order)) != len(media_order)):
                     raise ValueError("转发媒体选择须为非空、不重复且未越界的整数序号列表")
                 files = [files[i] for i in media_order]
+            if target_platform == "tiktok" and rec.media_type != "video":
+                raise ValueError("TikTok 网页发布当前仅支持视频")
+            if target_platform == "instagram" and len(files) > 10:
+                raise ValueError("Instagram 轮播发布最多支持 10 个媒体文件")
             if target_platform == "xhs":
                 from ..platforms.xhs.media import validate_publish_files
                 files = validate_publish_files(
                     "video" if rec.media_type == "video" else "images", files)
-            title_cap = {"douyin": 30, "shipinhao": 16}.get(target_platform, 20)
+            title_cap = {"douyin": 30, "shipinhao": 16, "bilibili": 80, "instagram": 2200}.get(target_platform, 20)
             t_title = (title if title is not None else (rec.desc or ""))[:title_cap]
             t_desc = desc if desc is not None else (rec.desc or "")
             t_topics = topics if topics is not None else ""
@@ -4284,10 +5467,21 @@ class MonitorEngine:
             dy_publish_transport = (resolve_transport(
                 self.cfg, "douyin", "publish", acc)
                 if platform == "douyin" else None)
-            api_only = bool(dy_publish_transport and
-                            dy_publish_transport["configured_mode"] == "api")
-            environment_error = self._native_write_environment_error(
-                acc, headed=not api_only, browser_mode=not api_only)
+            ig_publish_transport = (resolve_transport(
+                self.cfg, "instagram", "publish", acc)
+                if platform == "instagram" else None)
+            api_only = bool(
+                (dy_publish_transport and dy_publish_transport["configured_mode"] == "api")
+                or (ig_publish_transport and ig_publish_transport["effective_mode"] == "api")
+            )
+            skip_env_check = api_only or bool(
+                ig_publish_transport and ig_publish_transport["configured_mode"] == "hybrid"
+            )
+            environment_error = (
+                "" if skip_env_check else self._native_write_environment_error(
+                    acc, headed=not api_only, browser_mode=not api_only
+                )
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -4314,12 +5508,16 @@ class MonitorEngine:
             native_mode = acc.identity_mode == "native"
             identity = (None if dy_publish_transport and
                         dy_publish_transport["effective_mode"] == "unavailable"
-                        else self.browser.identity_for(acc))
+                        else (self.browser.identity_for(acc)
+                              if callable(getattr(self.browser, "identity_for", None))
+                              else None))
             media_type, title, desc, topics = t.media_type, t.title, t.desc, t.topics
             visibility, allow_save = t.visibility, t.allow_save
             allow_comment = getattr(t, "allow_comment", True)
             allow_duet = getattr(t, "allow_duet", True)
             allow_stitch = getattr(t, "allow_stitch", True)
+            bili_options = _loads(getattr(t, "bili_options_json", "{}") or "{}")
+            ig_options = _loads(getattr(t, "ig_options_json", "{}") or "{}")
             location = getattr(t, "location", "") or ""
             platform = t.platform
             files = _loads_list(t.media_json)
@@ -4337,92 +5535,148 @@ class MonitorEngine:
             # 快手发布:登录态在该账号持久 profile 里(creator/storage 任一即可),走浏览器自动化
             if not state:
                 return await self._finish_publish(
-                    task_id, False, "", "该账号未完成快手「创作者登录」,请先在账号页点「创作者登录」")
-            try:
-                ok, url, err = await publish_kuaishou(self.browser, identity, state,
-                                                      media_type, title, desc, files,
-                                                      topics=topics, headed=True,
-                                                      visibility=visibility,
-                                                      allow_save=allow_save)
-            except Exception as e:
-                ok, url, err = False, "", f"发布异常: {e!r}"
-            return await self._finish_publish(task_id, ok, url, err, platform="kuaishou")
+                    task_id, False, "",
+                    "该账号未完成快手「创作者登录」,请先在账号页点「创作者登录」",
+                    platform="kuaishou")
+            return await self._run_browser_publish(
+                task_id, "kuaishou", publish_kuaishou,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, headed=True, visibility=visibility,
+                allow_save=allow_save)
 
         if platform == "shipinhao":
             # 视频号发布:登录态在该账号持久 profile 里,走浏览器自动化(wujie shadowRoot)
             if not state:
                 return await self._finish_publish(
-                    task_id, False, "", "该账号未完成视频号登录,请先在账号页点「视频号登录」")
-            try:
-                ok, url, err = await publish_channels(self.browser, identity, state,
-                                                      media_type, title, desc, files,
-                                                      topics=topics, headed=True,
-                                                      location=location)
-            except Exception as e:
-                ok, url, err = False, "", f"发布异常: {e!r}"
-            return await self._finish_publish(task_id, ok, url, err, platform="shipinhao")
+                    task_id, False, "",
+                    "该账号未完成视频号登录,请先在账号页点「视频号登录」",
+                    platform="shipinhao")
+            return await self._run_browser_publish(
+                task_id, "shipinhao", publish_channels,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, headed=True, location=location)
 
         if platform == "douyin":
             # 抖音发布:同快手走浏览器自动化,登录态在该账号持久 profile 里
             if not state:
                 return await self._finish_publish(
-                    task_id, False, "", "该账号未完成抖音「创作者登录」,请先在账号页点「创作者登录」")
-            try:
-                ok, url, err = await publish_douyin(self.browser, identity, state,
-                                                    media_type, title, desc, files,
-                                                    topics=topics, visibility=visibility,
-                                                    allow_save=allow_save, headed=True)
-            except Exception as e:
-                ok, url, err = False, "", f"发布异常: {e!r}"
-            return await self._finish_publish(task_id, ok, url, err, platform="douyin")
+                    task_id, False, "",
+                    "该账号未完成抖音「创作者登录」,请先在账号页点「创作者登录」",
+                    platform="douyin")
+            return await self._run_browser_publish(
+                task_id, "douyin", publish_douyin,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, visibility=visibility,
+                allow_save=allow_save, headed=True)
 
         if platform == "tiktok":
             if not state:
                 return await self._finish_publish(
                     task_id, False, "", "该账号未完成 TikTok 登录，请先在账号页登录",
                     platform="tiktok")
-            try:
-                ok, url, err = await publish_tiktok(
-                    self.browser, identity, state, media_type, title, desc, files,
-                    topics=topics, visibility=visibility,
-                    allow_comment=allow_comment, allow_duet=allow_duet,
-                    allow_stitch=allow_stitch, headed=True,
-                    on_submit=(lambda: self._mark_write_submit(
-                        PublishTask, task_id, channel="browser")))
-            except asyncio.CancelledError:
-                await self._finish_publish(
-                    task_id, False, "",
-                    "write_uncertain:TikTok 发布已中断，结果需到平台核对",
-                    platform="tiktok")
-                raise
-            except Exception as e:
-                ok, url, err = False, "", f"发布异常: {e!r}"
-            return await self._finish_publish(
-                task_id, ok, url, err, platform="tiktok")
+            return await self._run_browser_publish(
+                task_id, "tiktok", publish_tiktok,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, visibility=visibility,
+                allow_comment=allow_comment, allow_duet=allow_duet,
+                allow_stitch=allow_stitch, headed=True)
+
+        if platform == "bilibili":
+            if not state:
+                return await self._finish_publish(
+                    task_id, False, "", "该账号未完成哔哩哔哩登录，请先在账号页扫码登录",
+                    platform="bilibili")
+            return await self._run_browser_publish(
+                task_id, "bilibili", publish_bilibili,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, visibility=visibility,
+                allow_comment=allow_comment, bili_options=bili_options,
+                headed=True)
+
+        if platform == "instagram":
+            if not state:
+                return await self._finish_publish(
+                    task_id, False, "", "该账号未完成 Instagram 登录，请先在账号页登录或导入 Cookie",
+                    platform="instagram")
+            ig_write_mode = str(
+                getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid"
+            ).strip().lower()
+            if ig_write_mode not in {"hybrid", "api", "browser"}:
+                ig_write_mode = "hybrid"
+            ig_channel = "api" if ig_write_mode in {"api", "hybrid"} else "browser"
+            return await self._run_browser_publish(
+                task_id, "instagram", publish_instagram,
+                self.browser, identity, state, media_type, title, desc, files,
+                topics=topics, visibility=visibility,
+                allow_comment=allow_comment, ig_options=ig_options,
+                mode=ig_write_mode, headed=True, channel=ig_channel)
 
         if not state:
             return await self._finish_publish(
-                task_id, False, "", "该账号未完成小红书「创作者登录」,请先在账号页点「创作者登录」")
+                task_id, False, "", "该账号未完成小红书「创作者登录」,请先在账号页点「创作者登录」",
+                platform="xhs")
 
         xhs_mode = ("browser" if native_mode
                     else self._xhs_publish_mode())
+        return await self._run_browser_publish(
+            task_id, "xhs", publish_xhs,
+            self.browser, identity, state, media_type, title, desc, files,
+            topics=topics, headed=True, mode=xhs_mode,
+            visibility=visibility, preserve_error=True, channel=xhs_mode,
+            cancel_message="write_uncertain:发布已中断，结果需到平台核对")
+
+    def get_publish_stage(self, task_id: int) -> str:
+        """Return transient browser publish progress/verification hint for UI polling."""
+        return str((getattr(self, "_publish_stages", None) or {}).get(task_id) or "")
+
+    def _set_publish_stage(self, task_id: int, stage: str) -> None:
+        stages = getattr(self, "_publish_stages", None)
+        if stages is None:
+            stages = {}
+            self._publish_stages = stages
+        text = str(stage or "").strip()
+        if text:
+            stages[task_id] = text
+        else:
+            stages.pop(task_id, None)
+
+    async def _run_browser_publish(self, task_id: int, platform: str, publish_fn,
+                                     *args, channel: str = "browser",
+                                     cancel_message: str = "", **kwargs) -> dict:
+        """Execute one platform publisher with uniform submit-boundary & cancel protection."""
+        pname = {"kuaishou": "快手", "douyin": "抖音",
+                 "shipinhao": "视频号", "tiktok": "TikTok",
+                 "bilibili": "哔哩哔哩", "instagram": "Instagram",
+                 "xhs": "小红书"}.get(platform, platform)
+        call_kwargs = dict(kwargs)
         try:
-            ok, url, err = await publish_xhs(self.browser, identity, state, media_type,
-                                             title, desc, files, topics=topics,
-                                             headed=True,
-                                             mode=xhs_mode,
-                                             visibility=visibility,
-                                             preserve_error=True,
-                                             on_submit=(
-                                                 lambda: self._mark_write_submit(
-                                                     PublishTask, task_id, channel=xhs_mode)))
+            params = inspect.signature(publish_fn).parameters
+            if "on_stage" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            ):
+                call_kwargs["on_stage"] = lambda msg: self._set_publish_stage(task_id, msg)
+        except Exception:
+            pass
+        default_channel = "api" if channel in {"api", "hybrid"} else "browser"
+        try:
+            ok, url, err = await publish_fn(
+                *args,
+                on_submit=(lambda ch=default_channel: self._mark_write_submit(
+                    PublishTask,
+                    task_id,
+                    channel=(ch if ch in {"api", "browser"} else default_channel),
+                )),
+                **call_kwargs,
+            )
         except asyncio.CancelledError:
-            await self._finish_publish(
-                task_id, False, "", "write_uncertain:发布已中断，结果需到平台核对")
+            msg = cancel_message or f"write_uncertain:{pname} 发布已中断，结果需到平台核对"
+            await self._finish_publish(task_id, False, "", msg, platform=platform)
             raise
         except Exception as e:
             ok, url, err = False, "", f"发布异常: {e!r}"
-        return await self._finish_publish(task_id, ok, url, err)
+        finally:
+            self._set_publish_stage(task_id, "")
+        return await self._finish_publish(task_id, ok, url, err, platform=platform)
 
     async def _finish_publish(self, task_id, ok, url, err, platform="xhs") -> dict:
         platform_error = err
@@ -4478,7 +5732,8 @@ class MonitorEngine:
                     channels = [{"type": c.type, "config": _loads(c.config)} for c in chans]
                 if channels:
                     pname = {"kuaishou": "快手", "douyin": "抖音",
-                             "shipinhao": "视频号", "tiktok": "TikTok"}.get(
+                             "shipinhao": "视频号", "tiktok": "TikTok",
+                             "bilibili": "哔哩哔哩", "instagram": "Instagram"}.get(
                                  platform, "小红书")
                     await notify_all(channels, f"{pname}发布成功", url or "已发布一条作品")
             except Exception:
@@ -4958,6 +6213,213 @@ class MonitorEngine:
                                   "ctx": {"nick": c.get("user_nickname", "")},
                                   "source_text": c.get("text", "")})
             return cands, ""
+        # ── 哔哩哔哩: WBI 搜索/空间 + 创作中心评论管理直连 ──
+        if platform == "bilibili":
+            bcli = BilibiliClient(
+                state,
+                getattr(identity, "ua", "") or self.cfg.engine.user_agent,
+                proxy=proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+            )
+            async with bcli.session_scope():
+                if mode == "auto_comment":
+                    if kind == "keyword":
+                        rows, _, err = await bcli.search_videos(
+                            rf["keyword"], page=1, page_size=20, order="pubdate"
+                        )
+                    else:
+                        rows, _, err = await bcli.fetch_user_videos(
+                            rf["sec_uid"], pn=1, ps=20, order="pubdate"
+                        )
+                    for r in rows[: self.cfg.engine.comment_recent_works]:
+                        aw = parse_bili_aweme(r, require_media=False)
+                        if aw:
+                            cands.append({
+                                "aweme_id": aw.aweme_id,
+                                "xsec_token": "",
+                                "target_comment_id": "",
+                                "target_nick": "",
+                                "ctx": {},
+                                "source_text": aw.desc,
+                            })
+                    return cands, err
+
+                # auto_reply: 回复自己稿件收到的评论
+                if rf["target_kind"] == "work" and rf["aweme_id"]:
+                    rows, err = await bcli.fetch_comments(
+                        rf["aweme_id"], max_count=40, include_replies=True
+                    )
+                    for c in rows:
+                        if not c.get("comment_id"):
+                            continue
+                        if (c.get("user_sec_uid") and c["user_sec_uid"] == acc_sec_uid) or (
+                            c.get("user_nickname") and c["user_nickname"] == acc_nick
+                        ):
+                            continue
+                        cands.append({
+                            "aweme_id": rf["aweme_id"],
+                            "xsec_token": "",
+                            "target_comment_id": c["comment_id"],
+                            "target_nick": c.get("user_nickname", ""),
+                            "ctx": {"nick": c.get("user_nickname", "")},
+                            "source_text": c.get("text", ""),
+                        })
+                    return cands, err
+
+                up_rows, _, up_err = await bcli.fetch_up_fulllist_comments(pn=1, ps=30)
+                comment_cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                for c in up_rows:
+                    bv = str(c.get("aweme_id") or "")
+                    cid = str(c.get("comment_id") or "")
+                    if not bv or not cid:
+                        continue
+                    ct = int(c.get("create_time") or 0)
+                    if comment_cutoff and ct and ct < comment_cutoff:
+                        continue
+                    if (c.get("user_sec_uid") and c["user_sec_uid"] == acc_sec_uid) or (
+                        c.get("user_nickname") and c["user_nickname"] == acc_nick
+                    ):
+                        continue
+                    cands.append({
+                        "aweme_id": bv,
+                        "xsec_token": "",
+                        "target_comment_id": cid,
+                        "target_nick": c.get("user_nickname", ""),
+                        "ctx": {"nick": c.get("user_nickname", "")},
+                        "source_text": c.get("text", ""),
+                    })
+                return cands, up_err
+        # ── Instagram: Mobile/Web API 搜索/时间线 + stream_comments 直连 + 浏览器回退 ──
+        if platform == "instagram":
+            imode = str(getattr(self.cfg.engine, "instagram_read_mode", "hybrid") or "hybrid").lower()
+            icli = InstagramClient(
+                state,
+                getattr(identity, "ua", "") or self.cfg.engine.user_agent,
+                proxy=proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+                account_seed=(
+                    (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                    if identity is not None
+                    else ""
+                ),
+                timezone_id=(
+                    getattr(identity, "timezone_id", "Asia/Shanghai")
+                    if identity is not None
+                    else "Asia/Shanghai"
+                ),
+            )
+            async with icli.session_scope():
+                if mode == "auto_comment":
+                    rows: list[dict] = []
+                    err = ""
+                    if imode in {"api", "hybrid"}:
+                        if kind == "keyword":
+                            rows, err = await icli.search_posts(rf["keyword"], max_pages=2)
+                        else:
+                            rows, _next, _more, err = await icli.fetch_user_feed(rf["sec_uid"])
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not rows and err)
+                    ) and identity is not None:
+                        if kind == "keyword":
+                            b_rows, b_err = await fetch_ig_search(
+                                self.browser, identity, rf["keyword"], max_scrolls=2
+                            )
+                        else:
+                            b_rows, _a, b_err = await fetch_ig_posts(
+                                self.browser, identity, rf["sec_uid"], set(), max_scrolls=2
+                            )
+                        if b_rows:
+                            rows, err = b_rows, ""
+                        elif imode == "browser":
+                            err = b_err
+                    for r in rows[: self.cfg.engine.comment_recent_works]:
+                        aw = parse_ig_aweme(r, require_media=False)
+                        if aw:
+                            cands.append({
+                                "aweme_id": aw.aweme_id,
+                                "xsec_token": "",
+                                "target_comment_id": "",
+                                "target_nick": "",
+                                "ctx": {"kw": rf["keyword"]} if kind == "keyword" else {},
+                                "source_text": aw.desc,
+                            })
+                    return cands, err
+
+                # auto_reply: 回复自己帖子/Reels 收到的评论
+                self_uid_str = str(icli.self_uid or acc_sec_uid or "")
+                works_to_check: list[str] = []
+                err = ""
+                if rf["target_kind"] == "work" and rf["aweme_id"]:
+                    works_to_check = [rf["aweme_id"]]
+                else:
+                    target_self = acc_sec_uid or icli.self_uid
+                    feed_rows: list[dict] = []
+                    if imode in {"api", "hybrid"} and target_self:
+                        feed_rows, _next, _more, err = await icli.fetch_user_feed(target_self)
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not feed_rows and err)
+                    ) and identity is not None and target_self:
+                        b_rows, _a, b_err = await fetch_ig_posts(
+                            self.browser, identity, target_self, set(), max_scrolls=2
+                        )
+                        if b_rows:
+                            feed_rows, err = b_rows, ""
+                        elif imode == "browser":
+                            err = b_err
+                    cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                    for r in feed_rows:
+                        aw = parse_ig_aweme(r, require_media=False)
+                        if aw and (not cutoff or not aw.create_time or aw.create_time >= cutoff):
+                            works_to_check.append(aw.aweme_id)
+                        if len(works_to_check) >= self.cfg.engine.comment_recent_works:
+                            break
+
+                comment_cutoff = int(time.time()) - max(0, self.cfg.engine.comment_recent_days) * 86400
+                for work_code in works_to_check:
+                    c_rows: list[dict] = []
+                    c_err = ""
+                    if imode in {"api", "hybrid"}:
+                        c_rows, c_err = await icli.fetch_comments(
+                            work_code, max_count=40, include_replies=True
+                        )
+                    if (
+                        imode == "browser"
+                        or (imode == "hybrid" and not c_rows and c_err)
+                    ) and identity is not None:
+                        b_c_rows, b_c_err = await fetch_ig_comments(
+                            self.browser, identity, work_code, max_count=40
+                        )
+                        if b_c_rows:
+                            c_rows, c_err = b_c_rows, ""
+                        elif imode == "browser":
+                            c_err = b_c_err
+                    if c_err and not c_rows:
+                        err = err or c_err
+                        continue
+                    for c in c_rows:
+                        cid = str(c.get("comment_id") or "")
+                        if not cid:
+                            continue
+                        ct = int(c.get("create_time") or 0)
+                        if comment_cutoff and ct and ct < comment_cutoff:
+                            continue
+                        if (
+                            (self_uid_str and str(c.get("user_uid") or "") == self_uid_str)
+                            or (acc_sec_uid and str(c.get("user_sec_uid") or "") == acc_sec_uid)
+                            or (acc_nick and c.get("user_nickname") == acc_nick)
+                        ):
+                            continue
+                        cands.append({
+                            "aweme_id": work_code,
+                            "xsec_token": "",
+                            "target_comment_id": cid,
+                            "target_nick": c.get("user_nickname", ""),
+                            "ctx": {"nick": c.get("user_nickname", "")},
+                            "source_text": c.get("text", ""),
+                        })
+                return cands, ("" if cands else err)
         # ── 抖音:浏览器自动化(发现仍用拦截抓取)──
         if mode == "auto_comment":
             if kind == "keyword":
@@ -5177,10 +6639,24 @@ class MonitorEngine:
             platform = t.platform
             dy_write_mode = (self._douyin_write_mode()
                              if platform == "douyin" else "browser")
-            api_only = platform == "douyin" and dy_write_mode == "api"
-            environment_error = ("" if api_only else
-                                 self._native_write_environment_error(
-                                     acc, headed=True, browser_mode=True))
+            bili_write_mode = (
+                str(getattr(self.cfg.engine, "bilibili_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "bilibili" else "browser"
+            )
+            ig_write_mode = (
+                str(getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "instagram" else "browser"
+            )
+            api_only = (
+                (platform == "douyin" and dy_write_mode == "api")
+                or (platform == "bilibili" and bili_write_mode in {"api", "hybrid"})
+                or (platform == "instagram" and ig_write_mode == "api")
+            )
+            environment_error = (
+                ""
+                if (api_only or (platform == "instagram" and ig_write_mode == "hybrid"))
+                else self._native_write_environment_error(acc, headed=True, browser_mode=True)
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -5448,7 +6924,102 @@ class MonitorEngine:
 
         method = "browser"
         try:
-            if platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
+            if platform == "bilibili" and bili_write_mode in {"api", "hybrid"}:
+                method = "api"
+                bcli = BilibiliClient(
+                    state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+                )
+                async with bcli.session_scope():
+                    if action == "follow":
+                        ok, err = await bcli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=True,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "unfollow":
+                        ok, err = await bcli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=False,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "send_dm":
+                        ok, err, _meta = await bcli.send_dm(
+                            target_uid or target_sec_uid or dm_conv_id,
+                            content,
+                            sender_uid=dm_self_uid,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    else:
+                        ok, err = False, f"未知动作 {action}"
+            elif platform == "instagram" and ig_write_mode in {"api", "hybrid"}:
+                method = "api"
+                icli = InstagramClient(
+                    state,
+                    ua,
+                    proxy=proxy,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    account_seed=(
+                        (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                        if identity is not None
+                        else ""
+                    ),
+                    timezone_id=(
+                        getattr(identity, "timezone_id", "Asia/Shanghai")
+                        if identity is not None
+                        else "Asia/Shanghai"
+                    ),
+                )
+                async with icli.session_scope():
+                    if action == "follow":
+                        ok, err = await icli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=True,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "unfollow":
+                        ok, err = await icli.modify_follow(
+                            target_uid or target_sec_uid,
+                            follow=False,
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    elif action == "send_dm":
+                        dm_target = dm_conv_id or target_uid or target_sec_uid
+                        ok, err, _meta = await icli.send_dm(
+                            dm_target,
+                            content,
+                            is_thread=bool(dm_conv_id and dm_target == dm_conv_id),
+                            on_submit=lambda: self._mark_write_submit(
+                                AccountActionTask, task_id, channel="api"
+                            ),
+                        )
+                    else:
+                        ok, err = False, f"未知动作 {action}"
+                if (
+                    not ok
+                    and ig_write_mode == "hybrid"
+                    and identity is not None
+                    and not str(err or "").startswith((
+                        "write_uncertain:",
+                        "target_resolution_failed:",
+                        "logged_out:",
+                        "verification_required:",
+                    ))
+                ):
+                    category, _signal = classify_platform_error(err)
+                    if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                        ok, err, method = await _browser_action()
+                        method = "browser_fallback" if method == "browser" else method
+            elif platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
                 method = "api"
                 cookie = dy_cookie_from_state(state)
                 if not cookie:
@@ -5635,10 +7206,28 @@ class MonitorEngine:
                 return {"ok": False, "error": "proxy unavailable"}
             dy_write_mode = (self._douyin_write_mode()
                              if platform == "douyin" else "browser")
-            api_only = platform == "douyin" and dy_write_mode == "api"
-            environment_error = ("" if api_only else
-                                 self._native_write_environment_error(
-                                     acc, headed=True, browser_mode=True))
+            bili_write_mode = (
+                str(getattr(self.cfg.engine, "bilibili_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "bilibili" else "browser"
+            )
+            ig_write_mode = (
+                str(getattr(self.cfg.engine, "instagram_write_mode", "hybrid") or "hybrid").lower()
+                if platform == "instagram" else "browser"
+            )
+            api_only = (
+                (platform == "douyin" and dy_write_mode == "api")
+                or (platform == "bilibili" and bili_write_mode == "api")
+                or (platform == "instagram" and ig_write_mode == "api")
+            )
+            environment_error = (
+                ""
+                if (
+                    api_only
+                    or (platform == "bilibili" and bili_write_mode == "hybrid")
+                    or (platform == "instagram" and ig_write_mode == "hybrid")
+                )
+                else self._native_write_environment_error(acc, headed=True, browser_mode=True)
+            )
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -5660,7 +7249,12 @@ class MonitorEngine:
             direct_environment = douyin_client_environment(acc)
             native_mode = acc.identity_mode == "native"
             # API-only 评论不启动账号浏览器；hybrid/browser 保留页面回退所需身份。
-            identity = None if api_only else self.browser.identity_for(acc)
+            identity = (
+                None if api_only
+                else (self.browser.identity_for(acc)
+                      if callable(getattr(self.browser, "identity_for", None))
+                      else None)
+            )
             t.status = "doing"; t.error = ""
             self._clear_row_block(t)
             s.add(t); s.commit()
@@ -5721,6 +7315,119 @@ class MonitorEngine:
                     require_reply=bool(target_cid),
                     on_submit=lambda: self._mark_write_submit(CommentTask, task_id),
                     headed=True, target_url=target_url)
+            elif platform == "bilibili":
+                if bili_write_mode in {"api", "hybrid"}:
+                    method = "api"
+                    bcli = BilibiliClient(
+                        state, ua, proxy=proxy, timeout=self.cfg.engine.request_timeout_seconds
+                    )
+                    async with bcli.session_scope():
+                        ok, err, cmeta = await bcli.post_comment(
+                            aweme_id,
+                            content,
+                            reply_to=target_cid,
+                            on_submit=lambda: self._mark_write_submit(
+                                CommentTask, task_id, channel="api"
+                            ),
+                        )
+                        result = str(cmeta.get("rpid") or "ok") if ok else ""
+                    if (
+                        not ok
+                        and bili_write_mode == "hybrid"
+                        and identity is not None
+                        and not target_cid
+                        and not str(err or "").startswith("write_uncertain:")
+                    ):
+                        category, _ = classify_platform_error(err)
+                        if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                            ok, err = await post_bili_comment(
+                                self.browser,
+                                identity,
+                                aweme_id,
+                                content,
+                                on_submit=lambda: self._mark_write_submit(
+                                    CommentTask, task_id, channel="browser"
+                                ),
+                            )
+                            method = "browser_fallback"
+                            result = "ok" if ok else ""
+                else:
+                    method = "browser"
+                    ok, err = await post_bili_comment(
+                        self.browser,
+                        identity,
+                        aweme_id,
+                        content,
+                        on_submit=lambda: self._mark_write_submit(
+                            CommentTask, task_id, channel="browser"
+                        ),
+                    )
+                    result = "ok" if ok else ""
+            elif platform == "instagram":
+                if ig_write_mode in {"api", "hybrid"}:
+                    method = "api"
+                    icli = InstagramClient(
+                        state,
+                        ua,
+                        proxy=proxy,
+                        timeout=self.cfg.engine.request_timeout_seconds,
+                        account_seed=(
+                            (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                            if identity is not None
+                            else ""
+                        ),
+                        timezone_id=(
+                            getattr(identity, "timezone_id", "Asia/Shanghai")
+                            if identity is not None
+                            else "Asia/Shanghai"
+                        ),
+                    )
+                    async with icli.session_scope():
+                        ok, err, cmeta = await icli.post_comment(
+                            aweme_id,
+                            content,
+                            reply_to=target_cid,
+                            on_submit=lambda: self._mark_write_submit(
+                                CommentTask, task_id, channel="api"
+                            ),
+                        )
+                        result = str(cmeta.get("comment_id") or "ok") if ok else ""
+                    if (
+                        not ok
+                        and ig_write_mode == "hybrid"
+                        and identity is not None
+                        and not target_cid
+                        and not str(err or "").startswith((
+                            "write_uncertain:",
+                            "logged_out:",
+                            "verification_required:",
+                        ))
+                    ):
+                        category, _ = classify_platform_error(err)
+                        if category in {RiskCategory.BUSINESS, RiskCategory.RISK}:
+                            ok, err = await post_ig_comment(
+                                self.browser,
+                                identity,
+                                aweme_id,
+                                content,
+                                on_submit=lambda: self._mark_write_submit(
+                                    CommentTask, task_id, channel="browser"
+                                ),
+                            )
+                            method = "browser_fallback"
+                            result = "ok" if ok else ""
+                else:
+                    method = "browser"
+                    ok, err = await post_ig_comment(
+                        self.browser,
+                        identity,
+                        aweme_id,
+                        content,
+                        on_submit=lambda: self._mark_write_submit(
+                            CommentTask, task_id, channel="browser"
+                        ),
+                    )
+                    result = "ok" if ok else ""
             elif platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
                 method = "api"
                 cookie = dy_cookie_from_state(state)
@@ -5925,6 +7632,7 @@ class MonitorEngine:
                 ext=m.get("ext", "mp4"),
                 index=m.get("index", 0),
                 decode_key=str(m.get("decode_key") or ""),
+                audio_url=str(m.get("audio_url") or ""),
             ))
         return aw
 
@@ -5964,10 +7672,101 @@ class MonitorEngine:
                 aw.source_url = tiktok_video_url(aw.aweme_id, t.sec_uid)
             needs_xhs_refetch = platform == "xhs" and (
                 not media_json or not aw.medias)
+            needs_bili_refetch = platform == "bilibili" and (
+                not media_json or not aw.medias)
+            needs_ig_refetch = platform == "instagram" and (
+                not media_json or not aw.medias)
             rec.download_status = "downloading"
-            if not needs_xhs_refetch:
+            if not needs_xhs_refetch and not needs_bili_refetch and not needs_ig_refetch:
                 rec.retry_count = (rec.retry_count or 0) + 1
             s.add(rec); s.commit()
+
+        if platform == "instagram" and (not media_json or not aw.medias):
+            icli = InstagramClient(
+                acc_state,
+                (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+                account_seed=(
+                    (getattr(identity, "fp_seed", "") or getattr(identity, "profile_dir", ""))
+                    if identity is not None
+                    else (acc.fp_seed or acc.profile_dir or "" if acc else "")
+                ),
+                timezone_id=(
+                    getattr(identity, "timezone_id", "Asia/Shanghai")
+                    if identity is not None
+                    else (acc.timezone_id or "Asia/Shanghai" if acc else "Asia/Shanghai")
+                ),
+            )
+            async with icli.session_scope():
+                aw2, _raw_m, ig_err = await icli.fetch_media_info(note_id)
+            if aw2 and aw2.medias:
+                aw = aw2
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                    }
+                    for m in aw.medias
+                ])
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.media_json = media_json
+                        s.add(rec); s.commit()
+            else:
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.download_status = "failed"
+                        rec.error = ig_err or "重拉 Instagram 作品详情仍无可用媒体直链"
+                        s.add(rec); s.commit()
+                return {"ok": False, "error": ig_err or "重拉 Instagram 作品详情仍无可用媒体直链"}
+
+        if platform == "bilibili" and (not media_json or not aw.medias):
+            bcli = BilibiliClient(
+                acc_state,
+                (acc.ua if acc and acc.ua else self.cfg.engine.user_agent),
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+            )
+            async with bcli.session_scope():
+                aw2, berr = await bcli.fetch_aweme_by_work(note_id, with_play_url=True)
+            if aw2 and aw2.medias:
+                aw = aw2
+                media_json = json.dumps([
+                    {
+                        "url": m.url,
+                        "kind": m.kind,
+                        "ext": m.ext,
+                        "index": m.index,
+                        **(
+                            {"audio_url": m.audio_url}
+                            if getattr(m, "audio_url", "")
+                            else {}
+                        ),
+                    }
+                    for m in aw.medias
+                ])
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.media_json = media_json
+                        s.add(rec); s.commit()
+            else:
+                with get_session() as s:
+                    rec = s.get(ContentRecord, record_id)
+                    if rec:
+                        rec.retry_count = (rec.retry_count or 0) + 1
+                        rec.download_status = "failed"
+                        rec.error = berr or "重拉 B 站稿件详情仍无可用直链"
+                        s.add(rec); s.commit()
+                return {"ok": False, "error": berr or "重拉 B 站稿件详情仍无可用直链"}
 
         # 小红书:无媒体快照时,重新拉详情补齐媒体直链
         if platform == "xhs" and (not media_json or not aw.medias):
@@ -6050,9 +7849,46 @@ class MonitorEngine:
                 acc, identity, self.cfg.engine.user_agent)
             download_referer = aw.source_url or tiktok_profile_url(
                 t.sec_uid if t else "")
+        elif platform == "bilibili":
+            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            if acc_state:
+                download_cookies = bili_cookie_map(acc_state)
+            download_referer = aw.source_url or f"https://www.bilibili.com/video/{note_id}"
+        elif platform == "instagram":
+            download_ua = acc.ua if (acc and acc.ua) else self.cfg.engine.user_agent
+            download_referer = "https://www.instagram.com/"
         ok, path, err = await self.downloader.download_aweme(
             aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
             cookies=download_cookies, referer=download_referer)
+        if not ok and platform == "bilibili" and not needs_bili_refetch and "403" in str(err):
+            # B 站 CDN 防盗链签名过期时自动重拉一次最新直链重试下载
+            bcli_refresh = BilibiliClient(
+                acc_state,
+                download_ua or self.cfg.engine.user_agent,
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+            )
+            async with bcli_refresh.session_scope():
+                aw_fresh, _ = await bcli_refresh.fetch_aweme_by_work(note_id, with_play_url=True)
+            if aw_fresh and aw_fresh.medias:
+                aw = aw_fresh
+                ok, path, err = await self.downloader.download_aweme(
+                    aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
+                    cookies=download_cookies, referer=download_referer)
+        elif not ok and platform == "instagram" and not needs_ig_refetch and "403" in str(err):
+            icli_refresh = InstagramClient(
+                acc_state,
+                download_ua or self.cfg.engine.user_agent,
+                proxy=acc_proxy,
+                timeout=self.cfg.engine.request_timeout_seconds,
+            )
+            async with icli_refresh.session_scope():
+                aw_fresh, _raw_m, _ = await icli_refresh.fetch_media_info(note_id)
+            if aw_fresh and aw_fresh.medias:
+                aw = aw_fresh
+                ok, path, err = await self.downloader.download_aweme(
+                    aw, base_dir, self._dl_proxy(acc_proxy), user_agent=download_ua,
+                    cookies=download_cookies, referer=download_referer)
         with get_session() as s:
             rec = s.get(ContentRecord, record_id)
             if rec:

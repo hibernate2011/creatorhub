@@ -1,6 +1,4 @@
-"""交互式扫码登录:打开真实浏览器窗口,用户扫码,落地登录态。
-对应原项目 internal/douyin.QRLoginManager(chromedp 版)。
-"""
+"""交互式浏览器登录：打开账号隔离窗口，完成扫码或网页验证并持久化登录态。"""
 from __future__ import annotations
 
 import asyncio
@@ -368,7 +366,7 @@ async def interactive_xhs_login(mgr: BrowserManager, identity: Identity,
         # 更容易被重定向到 website-login/captcha 的设备安全验证页。
         await page.goto(
             "https://www.xiaohongshu.com/",
-            wait_until="domcontentloaded", timeout=30000)
+            wait_until="domcontentloaded", timeout=60000)
         security_verification_seen = _is_xhs_security_verification_url(page.url)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0, timeout_seconds)
@@ -483,16 +481,27 @@ async def interactive_xhs_creator_login(mgr: BrowserManager, identity: Identity,
     与普通登录区分:这里登录的是创作平台,登录态里含 customerClientId / galaxy_creator_session_id 等。"""
     ctx = await mgr.context_for(identity)
     if force_reauth:
-        await ctx.clear_cookies()
+        # Only revoke creator cookies so complementing creator auth on an
+        # active read account preserves the main-site session in the profile.
+        try:
+            await ctx.clear_cookies(domain="creator.xiaohongshu.com")
+            for cookie_name in _XHS_CREATOR_COOKIES:
+                await ctx.clear_cookies(name=cookie_name)
+        except TypeError:
+            await ctx.clear_cookies()
     await _open_first_environment_check(mgr, identity, ctx)
     logged = False
     nickname = ""
     state_json = ""
     async with mgr.visible_page(identity) as page:
         await _focus(page)
+        # creator.xiaohongshu.com/login loads dozens of large script bundles
+        # before DOMContentLoaded; return on commit so slow/proxied networks
+        # render visibly instead of aborting the browser window at 30s.
         await page.goto(
             "https://creator.xiaohongshu.com/login",
-            wait_until="domcontentloaded", timeout=30000)
+            wait_until="commit", timeout=60000)
+        await _focus(page)
         init_ws = await _xhs_web_session(ctx)
         deadline = asyncio.get_running_loop().time() + max(0, timeout_seconds)
         while asyncio.get_running_loop().time() < deadline:
@@ -867,6 +876,219 @@ async def interactive_channels_creator_login(mgr: BrowserManager, identity: Iden
     """视频号无独立创作登录 —— 助手即创作平台,直接复用普通登录。"""
     return await interactive_channels_login(
         mgr, identity, timeout_seconds, force_reauth=force_reauth)
+
+
+_BILI_REQUIRED_COOKIES = {"SESSDATA", "bili_jct", "DedeUserID"}
+
+
+async def interactive_bilibili_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 240,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """哔哩哔哩扫码/网页登录。主站、创作中心与私信共享 `.bilibili.com` 顶域登录态。
+
+    判定登录：必须同时具备 `SESSDATA`、`bili_jct`、`DedeUserID` Cookie，且
+    `api.bilibili.com/x/web-interface/nav` 实测返回 `code == 0` 且 `data.isLogin == true`。
+    """
+    ctx = await mgr.open_headed(identity)
+    if force_reauth:
+        await ctx.clear_cookies()
+    await _open_first_environment_check(mgr, identity, ctx)
+    page = await ctx.new_page()
+    await _focus(page)
+    logged, nickname, state_json = False, "", ""
+    nav_user: dict = {}
+
+    async def on_response(resp):
+        try:
+            if "/x/web-interface/nav" not in str(resp.url or ""):
+                return
+            payload = await resp.json()
+            if not isinstance(payload, dict) or payload.get("code") != 0:
+                return
+            data = payload.get("data")
+            if isinstance(data, dict) and data.get("isLogin"):
+                nav_user.update(data)
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    try:
+        await page.goto(
+            "https://passport.bilibili.com/login",
+            wait_until="domcontentloaded",
+            timeout=40000,
+        )
+        await _focus(page)
+        waited = 0.0
+        verified_cookie_sig = ""
+        while waited < timeout_seconds:
+            if page.is_closed():
+                break
+            try:
+                cookies = await ctx.cookies()
+            except Exception:
+                break
+            cmap = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+            if all(cmap.get(k) for k in _BILI_REQUIRED_COOKIES):
+                sig = f"{cmap.get('DedeUserID')}:{cmap.get('bili_jct')}"
+                if not nav_user and sig != verified_cookie_sig:
+                    verified_cookie_sig = sig
+                    try:
+                        probe = await page.evaluate(
+                            """async () => {
+                                try {
+                                    const r = await fetch('https://api.bilibili.com/x/web-interface/nav?_t=' + Date.now(), {
+                                        credentials: 'include'
+                                    });
+                                    return await r.json();
+                                } catch (_) { return null; }
+                            }"""
+                        )
+                        if (
+                            isinstance(probe, dict)
+                            and probe.get("code") == 0
+                            and isinstance(probe.get("data"), dict)
+                            and probe["data"].get("isLogin")
+                        ):
+                            nav_user.update(probe["data"])
+                    except Exception:
+                        pass
+                if nav_user.get("isLogin"):
+                    logged = True
+                    nickname = str(nav_user.get("uname") or "").strip()[:40]
+                    break
+            await asyncio.sleep(1.0)
+            waited += 1.0
+
+        if logged:
+            await page.wait_for_timeout(1200)
+            state_json = json.dumps(await ctx.storage_state())
+    finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    return logged, state_json, nickname
+
+
+async def interactive_bilibili_creator_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 240,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """B 站创作中心 (`member.bilibili.com`) 复用 `.bilibili.com` 顶域登录态。"""
+    return await interactive_bilibili_login(
+        mgr, identity, timeout_seconds=timeout_seconds, force_reauth=force_reauth
+    )
+
+
+_IG_AUTH_BLOCKED_PATHS = ("/accounts/login", "/challenge/", "/checkpoint/", "/two_factor", "/suspended")
+
+
+async def interactive_instagram_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 240,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """Instagram 网页端登录（在账号专属隔离 Profile 内完成密码 / 2FA / 安全挑战验证）。
+
+    判定成功：同时具备 `sessionid` 与 `ds_user_id` Cookie，且当前 URL 已离开登录/挑战/2FA 页。
+    随后提取保存的 `storage_state` 供移动端 `Bearer IGT:2:` 与 Web 会话双栈复用。
+    """
+    ctx = await mgr.open_headed(identity)
+    if force_reauth:
+        await ctx.clear_cookies()
+    await _open_first_environment_check(mgr, identity, ctx)
+    page = await ctx.new_page()
+    await _focus(page)
+    logged, nickname, state_json = False, "", ""
+
+    try:
+        await page.goto(
+            "https://www.instagram.com/accounts/login/",
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+        await _focus(page)
+        waited = 0.0
+        stable_hits = 0
+        while waited < timeout_seconds:
+            if page.is_closed():
+                break
+            try:
+                cookies = await ctx.cookies(["https://www.instagram.com", "https://i.instagram.com"])
+            except Exception:
+                break
+            cmap = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+            cur_url = str(page.url or "").lower()
+            on_blocked = any(p in cur_url for p in _IG_AUTH_BLOCKED_PATHS)
+            if cmap.get("sessionid") and cmap.get("ds_user_id") and "instagram.com" in cur_url and not on_blocked:
+                stable_hits += 1
+                if stable_hits >= 2:
+                    logged = True
+                    break
+            else:
+                stable_hits = 0
+            await asyncio.sleep(1.5)
+            waited += 1.5
+
+        if logged:
+            await page.wait_for_timeout(1500)
+            cur_url = str(page.url or "").lower()
+            cookies = await ctx.cookies(["https://www.instagram.com", "https://i.instagram.com"])
+            cmap = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+            if cmap.get("sessionid") and not any(p in cur_url for p in _IG_AUTH_BLOCKED_PATHS):
+                try:
+                    probe = await page.evaluate(
+                        """async () => {
+                            try {
+                                const r = await fetch('https://www.instagram.com/api/v1/accounts/edit/web_form_data/', {
+                                    credentials: 'include',
+                                    headers: {
+                                        'X-IG-App-ID': '936619743392459',
+                                        'X-Requested-With': 'XMLHttpRequest'
+                                    }
+                                });
+                                if (!r.ok) return null;
+                                return await r.json();
+                            } catch (_) { return null; }
+                        }"""
+                    )
+                    if isinstance(probe, dict) and isinstance(probe.get("form_data"), dict):
+                        fd = probe["form_data"]
+                        nickname = str(fd.get("first_name") or fd.get("username") or "").strip()[:40]
+                except Exception:
+                    pass
+                state_json = json.dumps(await ctx.storage_state())
+            else:
+                logged = False
+    finally:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    return logged, state_json, nickname
+
+
+async def interactive_instagram_creator_login(
+    mgr: BrowserManager,
+    identity: Identity,
+    timeout_seconds: int = 240,
+    force_reauth: bool = False,
+) -> Tuple[bool, str, str]:
+    """Instagram 发布与主站共用 `.instagram.com` 会话。"""
+    return await interactive_instagram_login(
+        mgr, identity, timeout_seconds=timeout_seconds, force_reauth=force_reauth
+    )
 
 
 async def _read_ks_nickname(page) -> str:
