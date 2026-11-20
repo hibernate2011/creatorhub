@@ -96,8 +96,12 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     expect(history.locator('td[data-label="渠道"] .meta-chip')).to_have_text(["销售群", "预约群"])
     expect(history.get_by_role("link", name="装修流程介绍")).to_have_attribute(
         "href", "https://www.douyin.com/video/1234")
-    expect(history.get_by_role("link", name="用户主页")).to_have_attribute(
+    expect(history.get_by_role("link", name="示例客户", exact=True)).to_have_attribute(
         "href", "https://www.douyin.com/user/example")
+    expect(history.get_by_text("用户主页", exact=True)).to_have_count(0)
+    expect(history.locator('td[data-label="评论"] .watch-record-text + .content-published-time')).to_have_text(
+        "评论时间 2026-11-20 14:00:00")
+    expect(history.locator("td.watch-record-time")).not_to_contain_text("评论时间")
     expect(history.get_by_role("columnheader", name="平台", exact=True, include_hidden=True)).to_have_count(0)
     assert_no_overflow(page, f"comment-deliveries-{width}")
     page.locator('.pswitch [data-pf="xhs"]').click()

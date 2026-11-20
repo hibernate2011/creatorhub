@@ -14,21 +14,24 @@ function commentDeliveryLink(value, label) {
 }
 
 function commentDeliveryRow(row) {
-  const profile = commentDeliveryLink(row.user_profile_url, "用户主页");
+  const nickname = row.user_nickname || "匿名用户";
+  const profile = commentDeliveryLink(row.user_profile_url, nickname);
   const work = commentDeliveryLink(row.work_url, row.work_title || "打开作品");
   const channels = (row.destination_names || []).map(name => `<span class="meta-chip tag">${esc(name)}</span>`).join("");
   return `<tr>
-    <td class="watch-record-main" data-label="评论"><div class="watch-record-text">${esc(row.text || "（空评论）")}</div></td>
-    <td data-label="用户"><div class="comment-record-nickname">${esc(row.user_nickname || "—")}</div>
+    <td class="watch-record-main" data-label="评论">
+      <div class="watch-record-text">${esc(row.text || "（空评论）")}</div>
+      <div class="content-published-time">评论时间 ${esc(row.comment_time || "—")}</div>
+    </td>
+    <td data-label="用户"><div class="comment-record-nickname">${profile || esc(nickname)}</div>
       ${row.ip_label ? `<div class="comment-record-region">地区 ${esc(row.ip_label)}</div>` : ""}
-      ${profile || (row.user_id ? `<div class="comment-record-region">用户 ID ${esc(row.user_id)}</div>` : "")}</td>
+      ${!profile && row.user_id ? `<div class="comment-record-region">用户 ID ${esc(row.user_id)}</div>` : ""}</td>
     <td data-label="作品">${work || esc(row.work_title || "—")}</td>
     <td data-label="潜客置信度"><strong>${esc(row.confidence || "—")}</strong>
       ${row.group_tags ? `<div class="comment-record-region">分组标签 ${esc(row.group_tags)}</div>` : ""}</td>
     <td data-label="渠道"><div class="meta-stack comment-delivery-channels">${channels}</div></td>
     <td class="watch-record-time">
       <div class="comment-record-time-group"><span class="content-origin-label">最近推送</span>${contentCapturedTime(row.sent_at)}</div>
-      <div class="comment-record-time-group"><span class="content-origin-label">评论时间</span><span class="content-published-time">${esc(row.comment_time || "—")}</span></div>
     </td>
   </tr>`;
 }
