@@ -33,6 +33,7 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     rule.get_by_role("textbox", name="排除的业务或行业关键词").fill("跨境物流，金融科技")
     rule.get_by_role("button", name="适用平台", exact=True).click()
     expect(page.get_by_role("option", name="哔哩哔哩", exact=True)).to_be_visible()
+    expect(page.get_by_role("option", name="海外小红书", exact=True)).to_be_visible()
     page.get_by_role("option", name="Instagram", exact=True).click()
     rule.locator('select[multiple]').select_option(["21", "22"])
     assert rule.locator('select[multiple]').evaluate("el => el.selectedOptions.length") == 2

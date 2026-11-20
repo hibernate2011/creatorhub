@@ -1,6 +1,6 @@
 # CreatorHub
 
-本地运行的多平台内容管理工作台，支持 **抖音 / 小红书 / 快手 / 视频号 / TikTok / 哔哩哔哩 / Instagram**。
+本地运行的多平台内容管理工作台，支持 **抖音 / 小红书 / 海外小红书 / 快手 / 视频号 / TikTok / 哔哩哔哩 / Instagram**。
 
 [在线预览](https://3441293738.github.io/creatorhub/) · [平台能力](#平台能力) · [使用指南](https://3441293738.github.io/creatorhub/guide/) · [下载安装](https://github.com/3441293738/creatorhub/releases/latest) · [问题反馈](https://github.com/3441293738/creatorhub/issues) · [赞赏与交流](#赞赏与交流)
 
@@ -23,6 +23,7 @@
 |---|---|
 | 抖音 | 作品 / 评论 / 弹幕监控、批量采集、下载、发布与私信管理 |
 | 小红书 | 笔记 / 评论监控、关键词与收藏采集、下载、发布与私信管理 |
+| 海外小红书 | 四域名隔离（`rednote.com`）、关键词 / 创作者 / 收藏采集、作品与只读评论监控、下载、本账号作品管理与图文视频发布 |
 | 快手 | 作品 / 评论监控、批量采集、下载与发布 |
 | 视频号 | 本账号作品、数据与发布；连接本机微信后支持关键词 / 创作者采集、作品 / 评论监控与加密视频下载 |
 | TikTok | 关键词视频采集、作品 / 评论监控、下载、视频发布与用户互动 |
@@ -35,7 +36,7 @@
 
 ### 评论 AI 潜客分析
 
-评论监控支持逐行批量添加，也可以在采集结果中为单条作品开启监控。哔哩哔哩支持视频和动态，Instagram 支持帖子和 Reels，需要先绑定已登录账号。两个平台均支持按平台配置 AI 提示词、按目标设置分析和推送，并在推送记录中查看作品链接与可用的用户主页。
+评论监控支持逐行批量添加，也可以在采集结果中为单条作品开启监控。哔哩哔哩支持视频和动态，Instagram 支持帖子和 Reels，海外小红书（RedNote）支持笔记。Instagram 和 RedNote 需要绑定对应平台的已登录账号。三个平台均支持按平台配置 AI 提示词、按目标设置分析和推送，并在推送记录中查看作品链接与可用的用户主页。
 
 在「评论监控 → AI 潜客分析配置」填写 OpenRouter API Key，可开启抓取后自动分析。历史评论可在「评论记录」中勾选后点击「分析所选」，也可点击「分析所有记录」，将所有平台尚未分析的评论加入队列，范围包含当前筛选和分页以外的记录。使用 [Gemini Decision 1](https://openrouter.ai/google/gemini-decision-1) 的 [Decisions API](https://openrouter.ai/docs/guides/community/multimodal-decisions)，使用同一提示词版本和排除规则的评论可以跨作品、跨平台合并请求。每条 Question 包含平台、作品标题、用户昵称和评论内容，昵称用于辅助判断行业与需求的匹配度。列表可按分析状态和潜客置信度筛选，当前结果导出遵循相同筛选。
 
@@ -82,7 +83,7 @@ chmod +x start.sh
 
 详细功能、平台差异、操作步骤和配置统一维护在 **[使用指南](https://3441293738.github.io/creatorhub/guide/)**：
 
-- 按平台上手：[抖音](https://3441293738.github.io/creatorhub/guide/douyin/) · [小红书](https://3441293738.github.io/creatorhub/guide/xhs/) · [快手](https://3441293738.github.io/creatorhub/guide/kuaishou/) · [视频号](https://3441293738.github.io/creatorhub/guide/shipinhao/) · [TikTok](https://3441293738.github.io/creatorhub/guide/tiktok/) · [哔哩哔哩](https://3441293738.github.io/creatorhub/guide/bilibili/) · [Instagram](https://3441293738.github.io/creatorhub/guide/instagram/)
+- 按平台上手：[抖音](https://3441293738.github.io/creatorhub/guide/douyin/) · [小红书](https://3441293738.github.io/creatorhub/guide/xhs/) · [海外小红书](https://3441293738.github.io/creatorhub/guide/rednote/) · [快手](https://3441293738.github.io/creatorhub/guide/kuaishou/) · [视频号](https://3441293738.github.io/creatorhub/guide/shipinhao/) · [TikTok](https://3441293738.github.io/creatorhub/guide/tiktok/) · [哔哩哔哩](https://3441293738.github.io/creatorhub/guide/bilibili/) · [Instagram](https://3441293738.github.io/creatorhub/guide/instagram/)
 - 日常使用：[功能手册](https://3441293738.github.io/creatorhub/guide/#monitor) · [配置与账号环境](https://3441293738.github.io/creatorhub/guide/#settings) · [更新与备份](https://3441293738.github.io/creatorhub/guide/#backup)
 - 开发参考：[配置示例](config.example.yaml) · [更新日志](CHANGELOG.md) · [文档维护](guide/README.md)
 

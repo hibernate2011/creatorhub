@@ -140,7 +140,9 @@ def test_workbench_custom_interval_layout_keyboard_and_platform_drafts(ui):
 @pytest.mark.parametrize("platform,account_id,video,profile", [
     ("douyin", "1", "https://www.douyin.com/video/1234567890123456789", "https://www.douyin.com/user/test-profile"),
     ("bilibili", "6", "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
-    ("instagram", "7", "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+    ("instagram", "8", "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+    ("rednote", "7", "https://www.rednote.com/zh/discovery/item/67a1b2c3d4e5f60000000001",
+     "https://www.rednote.com/zh/user/profile/67a1b2c3d4e5f60000000002"),
 ])
 def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui, platform, account_id, video, profile):
     page, errors = ui
@@ -192,7 +194,7 @@ def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui, platfor
     expect(feedback).to_contain_text("已识别 3 条链接")
     assert targets.input_value() == f"{video}\n \n{profile}\ninvalid\n{video}"
 
-    if platform == "instagram":
+    if platform in {"instagram", "rednote"}:
         expect(page.locator("#w-acc")).to_have_value(account_id)
     page.locator("#w-acc").select_option(account_id, force=True)
     page.locator('.wb-sheet [data-composer="comments"] .wb-optional > summary').click()

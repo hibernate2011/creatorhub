@@ -31,6 +31,7 @@ from .notifier import send_one
 from .notifier.rate_limit import WebhookBusy, WebhookRateLimited, robot_key, webhook_ready
 from .platforms.bilibili.resolve import work_page_url as bili_work_url
 from .platforms.instagram.resolve import clean_ig_username, work_page_url as ig_work_url
+from .platforms.rednote.resolve import build_rednote_note_url, build_rednote_profile_url
 
 log = logging.getLogger(__name__)
 MODEL = "google/gemini-decision-1"
@@ -64,7 +65,7 @@ class PromptIn(BaseModel):
     text: str = Field(min_length=1, max_length=12000)
     exclude_keywords: list[str] = Field(default_factory=list)
     version: int = 1
-    platform: Literal["", "douyin", "xhs", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"] = ""
+    platform: Literal["", "douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"] = ""
     watch_ids: list[int] = Field(default_factory=list, max_length=500)
     work_ids: list[str] = Field(default_factory=list, max_length=500)
     groups: list[str] = Field(default_factory=list, max_length=100)
@@ -646,6 +647,10 @@ def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
         work_url = ig_work_url(row.aweme_id, source_url)
         if not profile and (username := clean_ig_username(row.user_sec_uid)):
             profile = f"https://www.instagram.com/{username}/"
+    elif row.platform == "rednote":
+        work_url = build_rednote_note_url(quote(row.aweme_id, safe=""))
+        if not profile:
+            profile = build_rednote_profile_url(quote(row.user_sec_uid, safe=""))
     return {
         "confidence": f"{row.confidence:.1%}" if row.confidence is not None else "",
         "group_tags": group_tags,

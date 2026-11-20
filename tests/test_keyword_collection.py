@@ -1326,8 +1326,11 @@ class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
 
     def add_work(self, platform, aweme_id, *, xsec_token="", xsec_source="", source_url=""):
         with db.get_session() as session:
+            cookie = {"name": "web_session", "value": "fixture"}
+            if platform == "rednote":
+                cookie.update(value="fixture-rednote-session", domain=".rednote.com")
             account = DouyinAccount(platform=platform, status="active", storage_state=json.dumps({
-                "cookies": [{"name": "web_session", "value": "fixture"}],
+                "cookies": [cookie],
             }))
             session.add(account)
             session.flush()
@@ -1391,20 +1394,24 @@ class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
              "https://www.bilibili.com/opus/1077998733285138440"),
             ("instagram", "DdL0sPNt5jn", "", "",
              "https://www.instagram.com/reel/DdL0sPNt5jn/"),
+            ("rednote", "67a1b2c3d4e5f60000000001", "rednote-token", "",
+             "https://www.rednote.com/zh/discovery/item/67a1b2c3d4e5f60000000001"),
         ]
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                      base_url="http://127.0.0.1") as client:
             for platform, aweme_id, token, author, source_url in cases:
                 with self.subTest(platform=platform):
-                    path, account_id = self.add_work(platform, aweme_id, xsec_token=token, source_url=source_url)
+                    source = "pc_user" if platform == "rednote" else ""
+                    path, account_id = self.add_work(platform, aweme_id, xsec_token=token, source_url=source_url,
+                                                     xsec_source=source)
                     wrong_job_path = f"/api/collections/999/contents/{path.split('/contents/', 1)[1]}"
                     self.assertEqual((await client.post(wrong_job_path, json={})).status_code, 404)
-                    if platform in {"xhs", "tiktok", "instagram"}:
+                    if platform in {"xhs", "tiktok", "instagram", "rednote"}:
                         self.assertEqual((await client.post(path, json={})).status_code, 400)
                     selected_account = None if platform == "bilibili" else account_id
                     response = await client.post(path, json={"account_id": selected_account})
                     self.assertEqual(response.status_code, 200, response.text)
-                    if platform in {"bilibili", "instagram"}:
+                    if platform in {"bilibili", "instagram", "rednote"}:
                         duplicate = await client.post("/api/comment-watches", json={
                             "platform": platform, "url_or_id": source_url, "account_id": selected_account,
                         })
@@ -1415,6 +1422,8 @@ class KeywordCollectionCommentWatchTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(watch.account_id, None if platform == "shipinhao" else selected_account)
                         if platform == "instagram":
                             self.assertEqual(watch.work_url, source_url)
+                        if platform == "rednote":
+                            self.assertEqual(watch.xsec_source, source)
 
     async def test_xhs_watch_uses_the_collected_token_source_when_scanning(self):
         from app.main import app

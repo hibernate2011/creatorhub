@@ -380,12 +380,15 @@ class CommentAITests(unittest.TestCase):
         self.assertTrue(row["sent_at"].endswith("+00:00"))
         self.assertNotIn("platform", row)
 
-    def test_bilibili_and_instagram_leads_keep_platform_links_in_delivery_history(self):
+    def test_leads_keep_platform_links_in_delivery_history(self):
         cases = [
             ("bilibili", "1077998733285138440", "12345", "上海",
              "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
             ("instagram", "DdL0sPNt5jn", "buyer.a", "",
              "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+            ("rednote", "67a1b2c3d4e5f60000000001", "67a1b2c3d4e5f60000000002", "加拿大",
+             "https://www.rednote.com/zh/discovery/item/67a1b2c3d4e5f60000000001",
+             "https://www.rednote.com/zh/user/profile/67a1b2c3d4e5f60000000002"),
         ]
         self.config["prompts"] += [
             dict(id=platform, name=platform, text="识别明确询价", platform=platform, work_ids=[work_id])
@@ -400,11 +403,11 @@ class CommentAITests(unittest.TestCase):
                 for platform, work_id, user, region, work_url, _ in cases
             ]
             session.add_all(comments)
-            self.assertEqual(ai.enqueue(session, comments, automatic=True)["queued"], 2)
+            self.assertEqual(ai.enqueue(session, comments, automatic=True)["queued"], len(cases))
             keys = [ai.analysis_id(comment) for comment in comments]
             session.commit()
             self.assertEqual([session.get(CommentAnalysis, key).prompt_id for key in keys],
-                             ["bilibili", "instagram"])
+                             [case[0] for case in cases])
 
         self.analyze_all()
         with db.get_session() as session:
