@@ -33,7 +33,7 @@ function fixture() {
     let COMMENT_PAGE=1,COMMENT_PAGE_SIZE=10,DANMAKU_PAGE=1,DANMAKU_PAGE_SIZE=10;
     const selComment=new Set(),WATCH_RECORD_STATE={comment:{cache:new Map(),scope:''},danmaku:{cache:new Map(),scope:''}};
     const VIEW_REQUESTS=new Map();let VIEW_SERIAL=0;`,context);
-  for (const name of ['esc','beginViewRequest','watchBaseName','watchName','contentCaptureBounds','contentCapturedTime',
+  for (const name of ['esc','safeMediaUrl','beginViewRequest','watchBaseName','watchName','contentCaptureBounds','contentCapturedTime',
     'watchRecordConfig','watchRecordSource','updateWatchRecordScope','populateWatchRecordSource','showWatchRecords','backToWatchTasks',
     'watchRecordSourceMarkup','watchRecordTimeMarkup','prepareWatchRecordLoad','watchRecordLoadError','cacheWatchRecordSources',
     'danmakuTime','refreshComments','refreshDanmaku','_moduleReportParams','delWatch','delDanmakuWatch'])
@@ -69,6 +69,12 @@ async function run() {
     assert.ok(html.includes(`showWatchRecords('${kind}',99)`) && html.includes('作品 ID：'));
     assert.equal(html.includes('来源任务'), kind === 'danmaku');
     assert.equal(html.includes('原任务已删除'), kind === 'danmaku');
+    f.context.row.work_url='https://www.xiaohongshu.com/explore/id?xsec_token=token&xsec_source=pc_feed';
+    const linked=f.run(`watchRecordSourceMarkup('${kind}',row)`);
+    assert.equal(linked.includes('href="https://www.xiaohongshu.com/explore/id?xsec_token=token&amp;xsec_source=pc_feed"'),kind==='comment');
+    assert.equal(linked.includes('target="_blank" rel="noopener noreferrer"'),kind==='comment');
+    f.context.row.work_url='javascript:alert(1)';
+    assert.ok(!f.run(`watchRecordSourceMarkup('${kind}',row)`).includes('href='));
     const time=f.run(`watchRecordTimeMarkup('${kind}',row)`);
     assert.ok(time.includes('2026-09-08T08:00:00.123Z')&&time.includes('published:123'));
     f.context.row.captured_at=null;

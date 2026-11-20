@@ -10,6 +10,7 @@ import re
 import urllib.parse
 from typing import Dict, List, Optional, Set, Tuple
 
+from ..platforms.xhs.resolve import note_url
 from .identity import Identity
 from .manager import BrowserManager
 
@@ -206,14 +207,6 @@ _SSR_PROFILE_AUTHOR_JS = """() => {
     if (profile && profile._rawValue !== undefined) profile = profile._rawValue;
     return JSON.stringify(profile && typeof profile === 'object' ? profile : {});
 }"""
-
-
-def _note_url(note_id: str, xsec_token: str = "", xsec_source: str = "pc_feed") -> str:
-    qs = {}
-    if xsec_token:
-        qs["xsec_token"] = xsec_token
-        qs["xsec_source"] = xsec_source or "pc_feed"
-    return f"{_BASE}/explore/{note_id}" + ("?" + urllib.parse.urlencode(qs) if qs else "")
 
 
 class _ResponseInbox:
@@ -716,7 +709,7 @@ async def fetch_xhs_note_detail(mgr: BrowserManager, identity: Identity, note_id
             responses = _ResponseInbox(
                 page, lambda r: FEED_API in r.url and r.status == 200)
             await page.goto(
-                _note_url(note_id, xsec_token, xsec_source),
+                note_url(note_id, xsec_token, xsec_source),
                 wait_until="domcontentloaded", timeout=30000)
             # 详情首屏目前由 SSR 直出，常常不会再请求 v1/feed。优先读取页面
             # 内联状态；老页面没有 SSR 时再等待 feed 响应。
@@ -785,7 +778,7 @@ async def fetch_xhs_comments(mgr: BrowserManager, identity: Identity, note_id: s
             responses = _ResponseInbox(
                 page, lambda r: COMMENT_API in r.url and r.status == 200)
             await page.goto(
-                _note_url(note_id, xsec_token, xsec_source),
+                note_url(note_id, xsec_token, xsec_source),
                 wait_until="domcontentloaded", timeout=30000)
             # 首屏评论也可能只存在 SSR 状态中，不再单独发 comment/page。
             try:

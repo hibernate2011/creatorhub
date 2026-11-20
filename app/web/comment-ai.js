@@ -3,6 +3,71 @@ const COMMENT_AI_LABELS = { unanalyzed: '未分析', queued: '等待分析', pro
 let COMMENT_AI_WATCHES = [];
 let COMMENT_AI_POLL = null;
 let COMMENT_AI_FIELD = 0;
+let COMMENT_DELIVERY_PAGE = 1;
+let COMMENT_DELIVERY_PLATFORM = "";
+let COMMENT_DELIVERY_REQUEST = null;
+const COMMENT_DELIVERY_COLUMNS = 6;
+
+function commentDeliveryLink(value, label) {
+  const url = /^https?:\/\//i.test(value || "") && safeMediaUrl(value);
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>` : "";
+}
+
+function commentDeliveryRow(row) {
+  const profile = commentDeliveryLink(row.user_profile_url, "用户主页");
+  const work = commentDeliveryLink(row.work_url, row.work_title || "打开作品");
+  const channels = (row.destination_names || []).map(name => `<span class="meta-chip tag">${esc(name)}</span>`).join("");
+  return `<tr>
+    <td class="watch-record-main" data-label="评论"><div class="watch-record-text">${esc(row.text || "（空评论）")}</div></td>
+    <td data-label="用户"><div class="comment-record-nickname">${esc(row.user_nickname || "—")}</div>
+      ${row.ip_label ? `<div class="comment-record-region">地区 ${esc(row.ip_label)}</div>` : ""}
+      ${profile || (row.user_id ? `<div class="comment-record-region">用户 ID ${esc(row.user_id)}</div>` : "")}</td>
+    <td data-label="作品">${work || esc(row.work_title || "—")}</td>
+    <td data-label="潜客置信度"><strong>${esc(row.confidence || "—")}</strong>
+      ${row.group_tags ? `<div class="comment-record-region">分组标签 ${esc(row.group_tags)}</div>` : ""}</td>
+    <td data-label="渠道"><div class="meta-stack comment-delivery-channels">${channels}</div></td>
+    <td class="watch-record-time">
+      <div class="comment-record-time-group"><span class="content-origin-label">最近推送</span>${contentCapturedTime(row.sent_at)}</div>
+      <div class="comment-record-time-group"><span class="content-origin-label">评论时间</span><span class="content-published-time">${esc(row.comment_time || "—")}</span></div>
+    </td>
+  </tr>`;
+}
+
+async function refreshCommentDeliveries(pageDelta = 0) {
+  const table = $("comment-delivery-table");
+  if (CURRENT_TAB !== "comments" || table?.closest(".wb-tabpanel")?.hidden !== false) return;
+  const status = $("comment-delivery-status"), pager = $("comment-delivery-pager");
+  if (COMMENT_DELIVERY_PLATFORM !== PLATFORM) {
+    COMMENT_DELIVERY_PLATFORM = PLATFORM;
+    COMMENT_DELIVERY_PAGE = 1;
+    table.innerHTML = skeleton(COMMENT_DELIVERY_COLUMNS);
+    status.textContent = "正在读取推送记录";
+    pager.hidden = true;
+  }
+  if (!pageDelta && COMMENT_DELIVERY_REQUEST?.()) return;
+  const isCurrent = beginViewRequest("comment-deliveries");
+  COMMENT_DELIVERY_REQUEST = isCurrent;
+  try {
+    const params = new URLSearchParams({platform: PLATFORM, page: String(COMMENT_DELIVERY_PAGE + pageDelta)});
+    const data = await api("/api/comment-ai/deliveries?" + params);
+    if (!isCurrent()) return;
+    COMMENT_DELIVERY_PAGE = data.page;
+    const html = data.items.map(commentDeliveryRow).join("") || empty(COMMENT_DELIVERY_COLUMNS, "暂无成功推送的评论", "i-send");
+    if (table.innerHTML !== html) table.innerHTML = html;
+    const count = `共 ${fmtNum(data.total)} 条已推送评论`;
+    if (status.textContent !== count) status.textContent = count;
+    $("comment-delivery-page").textContent = `第 ${data.page} / ${data.pages} 页`;
+    $("comment-delivery-prev").disabled = data.page <= 1;
+    $("comment-delivery-next").disabled = data.page >= data.pages;
+    pager.hidden = data.pages <= 1;
+  } catch {
+    if (!isCurrent()) return;
+    status.textContent = "推送记录加载失败，可点击刷新重试";
+    if (table.querySelector(".sk")) table.innerHTML = "";
+  } finally {
+    if (COMMENT_DELIVERY_REQUEST === isCurrent) COMMENT_DELIVERY_REQUEST = null;
+  }
+}
 
 function commentAIMarkup(row) {
   const ai = row.ai || {status: 'unanalyzed'};

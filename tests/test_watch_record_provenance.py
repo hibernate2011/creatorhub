@@ -12,6 +12,7 @@ from sqlalchemy import event, text
 
 import app.db as db
 import app.main as main
+from app.engine.monitor import MonitorEngine
 from app.models import (CommentWatch, CommentRecord, CommentWatchIdReservation,
                         DanmakuWatch, DanmakuRecord, DanmakuWatchIdReservation)
 from test_project_optimizations import local_project, store
@@ -130,6 +131,45 @@ def test_legacy_list_shape_and_unknown_capture_time(records):
     serialize = main._comment_dict if r.module == "comments" else main._danmaku_dict
     row = r.record(watch_id=None, aweme_id="missing-time", **{r.ident:"unknown"}, created_at=None, create_time=123)
     assert serialize(row)["captured_at"] is None
+
+
+@pytest.mark.parametrize("platform,work_id,watch_attrs,expected", [
+    ("douyin", "legacy", {}, "https://www.douyin.com/video/legacy"),
+    ("kuaishou", "photo", {}, "https://www.kuaishou.com/short-video/photo"),
+    ("xhs", "note", {"xsec_token": "a+b=", "xsec_source": "pc_search"},
+     "https://www.xiaohongshu.com/explore/note?xsec_token=a%2Bb%3D&xsec_source=pc_search"),
+    ("tiktok", "1234567890123456789", {"kind": "user", "sec_uid": "author"},
+     "https://www.tiktok.com/@author/video/1234567890123456789"),
+    ("tiktok", "1234567890123456789", {},
+     "https://www.tiktok.com/player/v1/1234567890123456789"),
+    ("shipinhao", "sph:share123", {}, "https://weixin.qq.com/sph/share123"),
+])
+def test_legacy_comment_links(local_project, platform, work_id, watch_attrs, expected):
+    watch_id = store(CommentWatch(platform=platform, aweme_id=work_id, **watch_attrs))
+    store(CommentRecord(platform=platform, watch_id=watch_id, aweme_id=work_id, comment_id="old"))
+    [row] = asyncio.run(main.list_comments(watch_id=watch_id))
+    assert row["work_url"] == expected
+
+
+def test_saved_comment_links_survive_watch_deletion(local_project):
+    work_id = "1234567890123456789"
+    original_url = f"https://www.tiktok.com/@original/video/{work_id}"
+    watch_id = store(CommentWatch(platform="tiktok", kind="user", sec_uid="original"))
+    store(CommentRecord(platform="tiktok", watch_id=watch_id, aweme_id=work_id, comment_id="old"))
+    engine = MonitorEngine.__new__(MonitorEngine)
+    count = asyncio.run(engine._ingest(
+        watch_id, work_id, [{"comment_id": "new", "create_time": 1}], "监控",
+        "作品名称", True, platform="tiktok", work_url=original_url))
+    assert count == 1
+    rows = asyncio.run(main.list_comments(watch_id=watch_id))
+    assert all(row["work_url"] == original_url for row in rows)
+    updated_url = f"https://www.tiktok.com/@renamed/video/{work_id}"
+    asyncio.run(engine._ingest(
+        watch_id, work_id, [], "监控", "", False, platform="tiktok", work_url=updated_url))
+    asyncio.run(main.del_watch(watch_id))
+    rows = asyncio.run(main.list_comments(watch_id=watch_id))
+    assert {row["comment_id"] for row in rows} == {"old", "new"}
+    assert all(row["work_url"] == updated_url and row["watch_source"]["deleted"] for row in rows)
 
 
 def test_count_is_actual_records_not_stale_scan_counter(records):

@@ -327,6 +327,7 @@ class CommentAITests(unittest.TestCase):
             delivery = session.get(CommentLeadDelivery, key + ":sales")
             self.assertNotIn("sign-secret", delivery.error)
             self.assertEqual(session.get(CommentAnalysis, key).status, "done")
+        self.assertEqual(ai.list_deliveries("douyin")["total"], 0)
         asyncio.run(ai.forward(ai.SelectionIn(ids=[row_id], retry_failed=True)))
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             asyncio.run(ai.process_delivery())
@@ -334,13 +335,99 @@ class CommentAITests(unittest.TestCase):
             asyncio.run(ai.process_delivery())
             self.assertEqual(send.await_count, 1)
             self.assertIn("评论：多少钱？想预约", send.call_args.args[3])
+            self.assertIn("作品名称：装修服务", send.call_args.args[3])
+
+    def test_delivery_history_keeps_the_fields_sent_after_source_changes(self):
+        self.config["destinations"].append({
+            **self.config["destinations"][0], "id": "appointments", "name": "预约群",
+            "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/appointments",
+        })
+        self.save()
+        with db.get_session() as session:
+            watch = CommentWatch(group_name="装修", tags='["咨询", "预约"]')
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        row_id, key = self.add(watch_id=watch_id, ip_label="北京")
+        self.analyze_all()
+        with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            with db.get_session() as session:
+                session.get(CommentAnalysis, key).work_title = "预约须知"
+                session.commit()
+            self.assertTrue(asyncio.run(ai.process_delivery()))
+            message = send.call_args.args[3]
+        with db.get_session() as session:
+            analysis = session.get(CommentAnalysis, key)
+            analysis.work_title = "更新后的作品名称"
+            analysis.ip_label = "上海"
+            session.delete(session.get(CommentRecord, row_id))
+            session.delete(session.get(CommentWatch, watch_id))
+            session.commit()
+        self.config["destinations"] = []
+        self.save()
+
+        history = ai.list_deliveries("douyin")
+        self.assertEqual(history["total"], 1)
+        [row] = history["items"]
+        for field, label in (("confidence", "潜客置信度"), ("group_tags", "分组标签"),
+                             ("ip_label", "用户地区"), ("work_title", "作品名称"),
+                             ("work_url", "作品链接"), ("text", "评论")):
+            self.assertIn(f"{label}：{row[field]}", message.splitlines())
+        self.assertEqual(row["work_title"], "预约须知")
+        self.assertEqual(row["group_tags"], "装修 / 咨询、预约")
+        self.assertEqual(row["destination_names"], ["预约群", "销售群"])
+        self.assertTrue(row["sent_at"].endswith("+00:00"))
+        self.assertNotIn("platform", row)
+
+    def test_delivery_history_pages_legacy_successes_in_the_requested_platform(self):
+        from app.main import app
+
+        _, key = self.add()
+        _, next_key = self.add(comment_id="c2", text="第二条评论")
+        _, other_key = self.add(platform="xhs")
+        now = datetime(2026, 11, 20)
+        with db.get_session() as session:
+            for analysis_id in (key, next_key, other_key):
+                session.get(CommentAnalysis, analysis_id).confidence = .85
+            for index, status in enumerate(("pending", "sending", "failed", "skipped"), start=3):
+                session.add(CommentLeadDelivery(id=f"legacy-{index}", analysis_id=key,
+                    destination_id="excluded", status=status, updated_at=now + timedelta(seconds=index)))
+            session.add(CommentLeadDelivery(id="older-channel", analysis_id=key,
+                destination_id="removed", status="sent", updated_at=now))
+            session.add(CommentLeadDelivery(id="other-comment", analysis_id=next_key,
+                destination_id="sales", status="sent", updated_at=now + timedelta(seconds=1)))
+            session.add(CommentLeadDelivery(id="latest-channel", analysis_id=key,
+                destination_id="sales", status="sent", updated_at=now + timedelta(seconds=2)))
+            session.add(CommentLeadDelivery(id="other-platform", analysis_id=other_key,
+                destination_id="sales", status="sent", updated_at=now))
+            session.commit()
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+                response = await client.get("/api/comment-ai/deliveries?platform=douyin&page_size=1")
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("test-secret", response.text)
+                first = response.json()
+                second = (await client.get("/api/comment-ai/deliveries?platform=douyin&page_size=1&page=2")).json()
+                other = (await client.get("/api/comment-ai/deliveries?platform=xhs")).json()
+                self.assertEqual((first["total"], first["page"], first["pages"]), (2, 1, 2))
+                self.assertEqual((second["total"], second["page"], second["pages"]), (2, 2, 2))
+                self.assertEqual(first["items"][0]["sent_at"], "2026-11-20T00:00:02+00:00")
+                self.assertEqual(second["items"][0]["sent_at"], "2026-11-20T00:00:01+00:00")
+                self.assertEqual(second["items"][0]["text"], "第二条评论")
+                self.assertEqual(first["items"][0]["confidence"], "85.0%")
+                self.assertEqual(first["items"][0]["destination_names"], ["销售群", "未知渠道"])
+                self.assertEqual(other["total"], 1)
+                self.assertEqual(other["items"][0]["work_url"], "https://www.xiaohongshu.com/explore/w1")
+        asyncio.run(run())
 
     def test_lead_message_links_and_omits_internal_fields(self):
         row = CommentAnalysis(id="a", platform="douyin", aweme_id="work", comment_id="private-comment",
             user_sec_uid="profile-id", user_nickname="客户", text="咨询", work_title="作品标题",
             confidence=.85, prompt_name="internal-prompt")
         text = ai.lead_text(row)
-        self.assertNotIn("作品：", text)
+        self.assertIn("作品名称：作品标题", text)
         self.assertIn("作品链接：https://www.douyin.com/video/work", text)
         self.assertIn("用户主页：https://www.douyin.com/user/profile-id", text)
         self.assertNotIn("private-comment", text)
@@ -572,7 +659,7 @@ class CommentAITests(unittest.TestCase):
         with patch.object(ai, "send_one", AsyncMock(return_value=(True, "ok"))) as send:
             self.assertTrue(asyncio.run(ai.process_delivery()))
             body = send.call_args.args[3]
-            self.assertNotIn("作品：", body)
+            self.assertIn("作品名称：装修服务真实标题", body)
             self.assertIn("作品链接：https://www.douyin.com/video/w1", body)
 
         raw_comment = {"cid": "new", "text": "怎么预约", "create_time": 1}

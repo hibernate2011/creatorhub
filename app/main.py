@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, suppress
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Literal
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from datetime import date, datetime, time, timedelta, timezone
@@ -83,6 +83,7 @@ from .platforms.xhs import (resolve_note as xhs_resolve_note,
                   parse_self_user as parse_xhs_self_user,
                   XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
                   has_creator_cookies)
+from .platforms.xhs.resolve import note_url as xhs_note_url
 from .platforms.kuaishou import (resolve_ks_user_id, resolve_ks_photo_id,
                   looks_like_photo as ks_looks_like_photo,
                   parse_self_user as parse_ks_self_user,
@@ -104,13 +105,18 @@ from .platforms.channels import (
     resolve_channels_user_id,
     set_active_proxy_manager,
 )
+from .platforms.channels.resolve import work_page_url as channels_work_url
 from .platforms.tiktok import (
     TikTokNativeClient,
     native_protocol_summary,
     parse_tiktok_app_context,
     tiktok_display_text,
 )
-from .platforms.tiktok.urls import parse_profile_reference, parse_video_reference
+from .platforms.tiktok.urls import (
+    parse_profile_reference,
+    parse_video_reference,
+    player_url as tiktok_player_url,
+)
 from .engine import Downloader, MonitorEngine
 from .engine.share_downloader import (
     clean_platform_share_target,
@@ -7744,13 +7750,7 @@ def _collection_local_media_paths(row: KeywordCollectionContent) -> list[Path]:
 
 def _collection_content_dict(row: KeywordCollectionContent) -> dict:
     if row.platform == "xhs":
-        query = urlencode({
-            "xsec_token": row.xsec_token,
-            "xsec_source": row.xsec_source or "pc_search",
-        }) if row.xsec_token else ""
-        url = f"https://www.xiaohongshu.com/explore/{row.aweme_id}"
-        if query:
-            url += "?" + query
+        url = xhs_note_url(row.aweme_id, row.xsec_token, row.xsec_source or "pc_search")
     elif row.platform == "kuaishou":
         url = f"https://www.kuaishou.com/short-video/{row.aweme_id}"
     elif row.platform == "shipinhao":
@@ -9824,7 +9824,7 @@ async def create_collection_comment_watch(job_id: int, content_id: int,
 @app.post("/api/comment-watches")
 async def add_watch(body: WatchIn):
     platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou", "shipinhao", "tiktok") else "douyin"
-    aweme_id = sec_uid = xsec_token = ""
+    aweme_id = sec_uid = xsec_token = xsec_source = ""
     title = ""
     target_input = _clean_platform_target_input(body.url_or_id, platform)
 
@@ -9845,6 +9845,7 @@ async def add_watch(body: WatchIn):
             if note_ref:
                 kind = "video"
                 aweme_id, xsec_token = note_ref.note_id, note_ref.xsec_token
+                xsec_source = note_ref.xsec_source
             else:
                 kind = "user"
         if kind == "video":
@@ -9853,6 +9854,7 @@ async def add_watch(body: WatchIn):
                 if not ref:
                     raise HTTPException(400, "无法解析小红书笔记,请粘贴完整分享文案、explore 笔记链接 / xhslink 短链 / 24 位 note_id")
                 aweme_id, xsec_token = ref.note_id, ref.xsec_token
+                xsec_source = ref.xsec_source
             title = "笔记 " + aweme_id
         else:
             ref = await xhs_resolve_user(target_input, cfg.engine.user_agent)
@@ -9959,7 +9961,8 @@ async def add_watch(body: WatchIn):
             if not (account.storage_state or account.creator_storage_state):
                 raise HTTPException(400, "所选 TikTok 账号缺少登录会话，请重新登录")
         w = CommentWatch(platform=platform, kind=kind, aweme_id=aweme_id, sec_uid=sec_uid,
-                          xsec_token=xsec_token, mode=mode, account_id=body.account_id,
+                          xsec_token=xsec_token, xsec_source=xsec_source,
+                          mode=mode, account_id=body.account_id,
                           interval_seconds=body.interval_seconds, title=title,
                           recent_works=body.recent_works,
                           recent_days=body.recent_days,
@@ -10105,9 +10108,12 @@ def _watch_captured_at(value):
 def _watch_records(session, rows, model):
     ids = {row.watch_id for row in rows if row.watch_id and row.watch_id > 0}
     watches = {w.id: w for w in session.exec(select(model).where(model.id.in_(ids))).all()} if ids else {}
-    serialize = _comment_dict if model is CommentWatch else _danmaku_dict
-    items = [serialize(row, _watch_source(row.watch_id, row.platform, model, watches.get(row.watch_id)))
-             for row in rows]
+    items = []
+    for row in rows:
+        watch = watches.get(row.watch_id)
+        source = _watch_source(row.watch_id, row.platform, model, watch)
+        items.append(_comment_dict(row, source, watch=watch) if model is CommentWatch
+                     else _danmaku_dict(row, source))
     if model is CommentWatch:
         from .comment_ai import attach_analysis
         attach_analysis(session, rows, items)
@@ -10115,11 +10121,37 @@ def _watch_records(session, rows, model):
 
 
 # ─────────── 评论数据 ───────────
-def _comment_dict(c: CommentRecord, watch_source: dict | None = None) -> dict:
+def _comment_work_url(c: CommentRecord, watch: CommentWatch | None) -> str:
+    if not c.aweme_id:
+        return ""
+    if c.work_url:
+        return c.work_url
+    if watch and (watch.platform != c.platform or
+                  (watch.kind == "video" and watch.aweme_id != c.aweme_id)):
+        watch = None
+    work_watch = watch if watch and watch.kind == "video" else None
+    if c.platform == "xhs":
+        if work_watch:
+            return xhs_note_url(c.aweme_id, work_watch.xsec_token, work_watch.xsec_source)
+        return xhs_note_url(c.aweme_id)
+    if c.platform == "shipinhao":
+        return channels_work_url(c.aweme_id, work_watch.xsec_token if work_watch else "")
+    if c.platform == "tiktok":
+        ref = parse_video_reference(c.aweme_id, watch.sec_uid) if watch else None
+        return ref.url if ref else tiktok_player_url(c.aweme_id)
+    if c.platform == "douyin":
+        return f"https://www.douyin.com/video/{quote(c.aweme_id, safe='')}"
+    if c.platform == "kuaishou":
+        return f"https://www.kuaishou.com/short-video/{quote(c.aweme_id, safe='')}"
+    return ""
+
+
+def _comment_dict(c: CommentRecord, watch_source: dict | None = None, *,
+                  watch: CommentWatch | None = None) -> dict:
     return {
         "id": c.id, "watch_id": c.watch_id, "aweme_id": c.aweme_id,
         "comment_id": c.comment_id, "text": c.text, "user_nickname": c.user_nickname,
-        "work_title": c.work_title,
+        "work_title": c.work_title, "work_url": _comment_work_url(c, watch),
         "user_sec_uid": c.user_sec_uid, "ip_label": c.ip_label,
         "like_count": c.like_count, "create_time": c.create_time,
         "is_reply": bool(c.reply_to),

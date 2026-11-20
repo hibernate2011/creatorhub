@@ -12,13 +12,13 @@ import logging
 import math
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, ConfigDict
-from sqlalchemy import and_, case, update
+from sqlalchemy import and_, case, func, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlmodel import select
 
@@ -282,7 +282,8 @@ def resolve_prompt(config, row, watch):
 
 def clean_work_title(value: str, aweme_id: str) -> str:
     title = value.strip() if isinstance(value, str) else ""
-    if title == aweme_id or any(title == f"{label} {aweme_id}" for label in ("视频", "作品", "笔记")):
+    if title == aweme_id or any(title == f"{label} {aweme_id}"
+                                 for label in ("视频", "作品", "笔记", "视频号作品")):
         return ""
     if title.startswith("@") and title.partition(" ")[2] == f"视频 {aweme_id}":
         return ""
@@ -603,7 +604,7 @@ async def process_batch(load_douyin_title: DouyinTitleLoader | None = None):
     return True
 
 
-def lead_text(row, watch: CommentWatch | None = None):
+def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
     work_urls = {"douyin": "https://www.douyin.com/video/", "xhs": "https://www.xiaohongshu.com/explore/",
                  "kuaishou": "https://www.kuaishou.com/short-video/"}
     profile_urls = {"douyin": "https://www.douyin.com/user/", "xhs": "https://www.xiaohongshu.com/user/profile/",
@@ -616,29 +617,48 @@ def lead_text(row, watch: CommentWatch | None = None):
             ).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         pass
-    lines = [f"潜客置信度：{row.confidence:.1%}", f"平台：{row.platform}"]
+    group_tags = ""
     if watch:
         tags = "、".join(load_tags(watch.tags))
         group_tags = " / ".join(filter(None, (watch.group_name, tags)))
-        if group_tags:
-            lines.append(f"分组标签：{group_tags}")
-    lines.append(f"用户：{row.user_nickname[:100]}")
-    if row.ip_label:
-        lines.append(f"用户地区：{row.ip_label}")
-    lines.extend([f"评论：{row.text[:1800]}", f"评论时间：{comment_time}"])
-    if row.platform in work_urls and row.aweme_id:
-        lines.append(f"作品链接：{work_urls[row.platform]}{quote(row.aweme_id, safe='')}")
+    work_url = (work_urls[row.platform] + quote(row.aweme_id, safe="")
+                if row.platform in work_urls and row.aweme_id else "")
     profile = row.user_profile_url
     if not profile and row.platform in profile_urls and row.user_sec_uid:
         profile = profile_urls[row.platform] + quote(row.user_sec_uid, safe="")
-    if profile:
-        lines.append(f"用户主页：{profile}")
-    elif row.user_sec_uid:
-        lines.append(f"用户 ID：{row.user_sec_uid}")
+    return {
+        "confidence": f"{row.confidence:.1%}" if row.confidence is not None else "",
+        "group_tags": group_tags,
+        "user_nickname": row.user_nickname[:100],
+        "ip_label": row.ip_label,
+        "text": row.text[:1800],
+        "comment_time": comment_time,
+        "work_title": clean_work_title(row.work_title, row.aweme_id)[:2000],
+        "work_url": work_url,
+        "user_profile_url": profile,
+        "user_id": "" if profile else row.user_sec_uid,
+    }
+
+
+def lead_text(row, watch: CommentWatch | None = None, *, fields: dict | None = None) -> str:
+    message = fields if fields is not None else lead_message_fields(row, watch)
+    lines = [f"潜客置信度：{message['confidence']}", f"平台：{row.platform}"]
+    if message["group_tags"]:
+        lines.append(f"分组标签：{message['group_tags']}")
+    lines.append(f"用户：{message['user_nickname']}")
+    if message["ip_label"]:
+        lines.append(f"用户地区：{message['ip_label']}")
+    lines.extend([f"评论：{message['text']}", f"评论时间：{message['comment_time']}"])
+    for key, label in (("work_title", "作品名称"), ("work_url", "作品链接"),
+                       ("user_profile_url", "用户主页"), ("user_id", "用户 ID")):
+        if message[key]:
+            lines.append(f"{label}：{message[key]}")
     return "\n".join(lines)
 
 
 def _fill_missing_comment_metadata(session, analysis):
+    if not clean_work_title(analysis.work_title, analysis.aweme_id):
+        analysis.work_title = find_work_title(session, analysis.platform, analysis.aweme_id)
     source_match = (
         CommentRecord.platform == analysis.platform,
         CommentRecord.aweme_id == analysis.aweme_id,
@@ -681,7 +701,8 @@ async def process_delivery():
                 break
             cooling.add(row.destination_id)
         _fill_missing_comment_metadata(session, analysis)
-        key, text = row.id, lead_text(analysis, watch)
+        message = lead_message_fields(analysis, watch)
+        key, text = row.id, lead_text(analysis, watch, fields=message)
         claimed = session.execute(update(CommentLeadDelivery).where(CommentLeadDelivery.id == key,
             CommentLeadDelivery.status == "pending").values(status="sending", attempts=CommentLeadDelivery.attempts + 1,
                                                            updated_at=datetime.utcnow()))
@@ -706,6 +727,8 @@ async def process_delivery():
         row = session.get(CommentLeadDelivery, key)
         row.status = "sent" if ok else "failed"
         row.error = "" if ok else redact_detail(dest["type"], dest, detail)
+        if ok:
+            row.message_json = json.dumps({**message, "destination_name": dest["name"]}, ensure_ascii=False)
         row.updated_at = datetime.utcnow()
         session.add(row)
         session.commit()
@@ -773,6 +796,56 @@ async def worker(load_douyin_title: DouyinTitleLoader | None = None):
 
 
 router = APIRouter(prefix="/api/comment-ai", tags=["comment-ai"])
+
+
+@router.get("/deliveries")
+def list_deliveries(platform: str, page: Annotated[int, Query(ge=1)] = 1,
+                    page_size: Annotated[int, Query(ge=1, le=100)] = 20):
+    delivery, analysis = CommentLeadDelivery, CommentAnalysis
+    sent = (select(delivery.analysis_id, func.max(delivery.updated_at).label("sent_at"))
+            .join(analysis, delivery.analysis_id == analysis.id)
+            .where(delivery.status == "sent", analysis.platform == platform)
+            .group_by(delivery.analysis_id).subquery())
+    with get_session() as session:
+        total = session.exec(select(func.count()).select_from(sent)).one()
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        page_comments = (select(sent).order_by(sent.c.sent_at.desc(), sent.c.analysis_id.desc())
+                         .offset((page - 1) * page_size).limit(page_size).subquery())
+        rows = session.exec(
+            select(delivery, analysis).join(analysis, delivery.analysis_id == analysis.id)
+            .join(page_comments, page_comments.c.analysis_id == delivery.analysis_id)
+            .where(delivery.status == "sent")
+            .order_by(page_comments.c.sent_at.desc(), page_comments.c.analysis_id.desc(),
+                      delivery.updated_at.desc(), delivery.id.desc())
+        ).all()
+        # Older successful deliveries only retained the analysis and watch IDs.
+        legacy = [(d, a) for d, a in rows if not d.message_json]
+        watch_ids = {a.watch_id if d.watch_id is None else d.watch_id for d, a in legacy} - {0}
+        watches = {}
+        if watch_ids:
+            watches = {w.id: w for w in session.exec(select(CommentWatch).where(CommentWatch.id.in_(watch_ids)))}
+        names = {d["id"]: d["name"] for d in settings(session)["destinations"]} if legacy else {}
+        for watch in watches.values():
+            names.update({f"watch:{watch.id}:{d['id']}": d["name"] for d in watch_policy(watch)["destinations"]})
+        items = {}
+        for d, a in rows:
+            if d.message_json:
+                message = json.loads(d.message_json)
+                name = message.pop("destination_name", "")
+            else:
+                watch = watches.get(a.watch_id if d.watch_id is None else d.watch_id)
+                message = lead_message_fields(a, watch)
+                name = names.get(d.destination_id, "")
+            name = name or "未知渠道"
+            if d.analysis_id not in items:
+                items[d.analysis_id] = {**message, "destination_names": [name],
+                                        "sent_at": d.updated_at.replace(tzinfo=timezone.utc).isoformat()}
+            else:
+                channels = items[d.analysis_id]["destination_names"]
+                if name not in channels:
+                    channels.append(name)
+        return {"items": list(items.values()), "total": total, "page": page, "pages": pages}
 
 
 @router.get("/settings")

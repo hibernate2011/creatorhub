@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote, urlencode
 
 from curl_cffi.requests import AsyncSession
 
@@ -33,6 +34,13 @@ class UserRef:
     user_id: str
     xsec_token: str = ""
     xsec_source: str = ""
+
+
+def note_url(note_id: str, xsec_token: str = "", xsec_source: str = "pc_feed") -> str:
+    url = f"https://www.xiaohongshu.com/explore/{quote(note_id, safe='')}"
+    if xsec_token:
+        url += "?" + urlencode({"xsec_token": xsec_token, "xsec_source": xsec_source or "pc_feed"})
+    return url
 
 
 def _tok(text: str) -> tuple[str, str]:

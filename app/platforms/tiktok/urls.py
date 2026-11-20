@@ -50,6 +50,11 @@ def video_url(aweme_id: str, author: str) -> str:
     return f"https://www.tiktok.com/@{quote(unique_id, safe='._-')}/video/{item_id}"
 
 
+def player_url(aweme_id: str) -> str:
+    item_id = str(aweme_id or "").strip()
+    return f"https://www.tiktok.com/player/v1/{item_id}" if _VIDEO_ID_RE.fullmatch(item_id) else ""
+
+
 def parse_video_reference(value: str, author_unique_id: str = "") -> TikTokVideoRef | None:
     """Parse a standard URL/share text, or an ID paired with author_unique_id."""
     text = str(value or "").strip()

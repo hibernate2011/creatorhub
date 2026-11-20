@@ -394,6 +394,7 @@ class CommentRecord(SQLModel, table=True):
     comment_id: str = Field(index=True)        # 抖音 cid
     text: str = ""
     work_title: str = ""                     # 抓取时保存作品标题，供潜客判断使用
+    work_url: str = ""                       # 需要作品 ID 之外的参数时保存原作品链接
     user_nickname: str = ""
     user_sec_uid: str = ""                    # 评论用户的平台标识
     user_profile_url: str = ""
@@ -450,6 +451,7 @@ class CommentLeadDelivery(SQLModel, table=True):
     status: str = Field(default="pending", index=True)
     attempts: int = 0
     error: str = ""
+    message_json: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

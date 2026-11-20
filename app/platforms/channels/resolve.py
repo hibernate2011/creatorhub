@@ -131,6 +131,17 @@ def build_finder_feed_url(
     return "https://channels.weixin.qq.com/web/pages/feed?" + "&".join(parts)
 
 
+def work_page_url(work_id: str, object_nonce_id: str = "") -> str:
+    share_id = work_id.removeprefix("sph:")
+    if share_id != work_id and _SPH_ID_RE.fullmatch(share_id):
+        return f"https://weixin.qq.com/sph/{share_id}"
+    if work_id.isdecimal():
+        return build_finder_feed_url(work_id, object_nonce_id)
+    if work_id and share_id == work_id:
+        return build_finder_feed_url("", export_id=work_id)
+    return ""
+
+
 def normalize_finder_username(raw: str) -> str:
     """规范化 `v2_...@finder` 用户名。"""
     val = (raw or "").strip()

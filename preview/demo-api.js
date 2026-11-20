@@ -287,6 +287,7 @@
     if (path === "/api/comment-watches") return platform === "shipinhao" ? [] : watches(platform);
     if (path === "/api/comment-ai/settings") return {api_key: "", auto_analyze: false, auto_forward: false, batch_size: 30,
       prompts: [{id: "default", name: "默认潜客判断", text: "结合作品标题判断评论是否表达询价、购买、预约或明确需求。排除广告、闲聊和单纯夸赞；信息不足时保守判断。", version: 1, platform: "", watch_ids: [], work_ids: [], groups: [], enabled: true}], destinations: []};
+    if (path === "/api/comment-ai/deliveries") return {items: [], total: 0, page: 1, pages: 1};
     if (path === "/api/comments") return watchRecordsPage(url, platform === "shipinhao" ? [] : comments(platform), "comments", platform);
     if (path === "/api/danmaku-watches") return platform === "douyin" ? danmakuWatches() : [];
     if (path === "/api/danmaku") return watchRecordsPage(url, platform === "douyin" ? [

@@ -69,7 +69,7 @@ const groupSpecs = {
   accounts: [["accounts", "账号列表"], ["inbox", "聚合私信", ["douyin", "xhs", "kuaishou"]], ["runtime", "浏览器内核"], ["proxies", "代理池"]],
   settings: [["appearance", "外观与体验"], ["downloads", "下载设置"], ["ai", "AI 文案"], ["engine", "采集与运行"], ["channels", "视频号微信通道"]],
   monitors: [["targets", "监控目标"], ["records", "作品记录"]],
-  comments: [["targets", "监控目标"], ["records", "评论记录"]],
+  comments: [["targets", "监控目标"], ["records", "评论记录"], ["deliveries", "推送记录"]],
   danmaku: [["targets", "监控目标"], ["records", "弹幕记录"]],
   autocomment: [["rules", "评论规则"], ["tasks", "任务与审核"]],
   publish: [["editor", "撰写内容"], ["records", "发布记录"], ["published", "已发布作品", ["xhs"]]],
@@ -171,7 +171,7 @@ function NodeHost({ node, className = "" }) {
   return <div className={className} ref={ref} />;
 }
 const tabSetters = new Map();
-function SectionTabs({ group, platform }) {
+function SectionTabs({ group, platform, active }) {
   const [value, setValue] = useState(group.items[0].value);
   const root = useRef(null), list = useRef(null), previous = useRef(value);
   const visible = group.items.filter(item => !item.node.hidden && (!item.platforms || item.platforms.includes(platform)));
@@ -180,6 +180,9 @@ function SectionTabs({ group, platform }) {
     return () => tabSetters.delete(group.key);
   }, [group]);
   useEffect(() => { if (!visible.some(item => item.value === value)) setValue(visible[0].value); }, [platform]);
+  useEffect(() => {
+    if (active && group.key === "comments" && value === "deliveries") window.refreshCommentDeliveries();
+  }, [active, group.key, platform, value]);
   useLayoutEffect(() => selectionMarker(list.current, '[data-state="active"]', "line"), []);
   useLayoutEffect(() => {
     if (previous.current !== value) {
@@ -291,7 +294,7 @@ const readFailures = new Map();
 const latestReads = new Map();
 let readSerial = 0;
 const prefixes = { overview: ["/api/overview", "/api/stats", "/api/task-queue"], accounts: ["/api/accounts", "/api/browser-runtimes", "/api/proxies"],
-  monitors: ["/api/monitors", "/api/contents"], comments: ["/api/comment-watches", "/api/comments"], danmaku: ["/api/danmaku"],
+  monitors: ["/api/monitors", "/api/contents"], comments: ["/api/comment-watches", "/api/comments", "/api/comment-ai/deliveries"], danmaku: ["/api/danmaku"],
   collections: ["/api/collections"], queue: ["/api/task-queue"], publish: ["/api/publish"], autocomment: ["/api/comment-rules", "/api/comment-tasks"],
   settings: ["/api/settings", "/api/channels/protocol"], notifications: ["/api/notifications"], "risk-control": ["/api/risk"], hub: ["/api/accounts", "/api/hub"] };
 let menuOpen = false, sheetOpen = false;
@@ -454,7 +457,7 @@ function App() {
     else document.querySelector('#workbench-actions button')?.focus({ preventScroll: true });
   });
   return <>
-    {groups.map(group => createPortal(<SectionTabs group={group} platform={ctx.platform} />, group.target, group.key))}
+    {groups.map(group => createPortal(<SectionTabs group={group} platform={ctx.platform} active={ctx.tab === group.key} />, group.target, group.key))}
     {createPortal(<div className="wb-page-actions">
       <Onboarding platform={ctx.platform} />
       <span className="wb-refresh-control">

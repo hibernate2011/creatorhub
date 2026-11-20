@@ -1291,6 +1291,7 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
 .comment-record-table .content-origin { justify-items:start; gap:2px; margin:8px 0 0; }
 .comment-record-table .content-source-link { min-height:28px; font-weight:600; }
 .comment-record-table .watch-record-work { margin:0; font-variant-numeric:tabular-nums; }
+.comment-record-table .watch-record-work a { color:var(--acc); text-decoration:underline; }
 .comment-record-nickname { color:var(--fg-strong); font-size:14px; font-weight:600; line-height:1.5; }
 .comment-record-region { margin-top:4px; color:var(--mut); font-size:12px; }
 .comment-record-table .comment-user-sec { max-width:none; margin-top:5px; font-size:11px; }
@@ -1307,6 +1308,17 @@ button, input, textarea, select, .cs-trg, .dt-trg { border-radius:10px; }
 .comment-record-ai-status { padding:1px 7px; border-radius:6px; background:var(--surface-2); }
 .comment-record-ai-status[data-status="done"] { color:var(--success); background:var(--success-soft); }
 .comment-record-ai-status[data-status="failed"] { color:var(--danger); background:var(--danger-soft); }
+
+.comment-delivery-table th:nth-child(2),.comment-delivery-table th:nth-child(3),
+.comment-delivery-table th:nth-child(4) { width:14%; }
+.comment-delivery-table th:nth-child(5) { width:17%; }
+.comment-delivery-table th:last-child { width:176px; }
+.comment-delivery-table td { vertical-align:top; }
+.comment-delivery-table a { color:var(--acc); text-decoration:underline; }
+.comment-delivery-table .watch-record-text { white-space:pre-wrap; }
+.comment-delivery-table .watch-record-time .content-captured-time { margin:0; }
+.comment-delivery-channels .meta-chip { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+.comment-delivery-pager { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:12px; }
 
 @media(min-width:1100px) {
   .content-record-table .content-col-type { width:84px; }

@@ -52,6 +52,15 @@
       record({path: url.pathname, search: url.search, body: init.body || null});
       return json({queued: 1250, skipped: 0}, 202);
     }
+    if (url.pathname === '/api/comment-ai/deliveries' && method === 'GET') {
+      const items = url.searchParams.get('platform') === 'douyin' ? [...forwarded].map(() => ({
+        confidence: '91.0%', group_tags: '装修 / 咨询', user_nickname: '示例客户', ip_label: '北京',
+        text: '请问怎么预约？', comment_time: '2026-11-20 14:00:00', work_title: '装修流程介绍',
+        work_url: 'https://www.douyin.com/video/1234', user_profile_url: 'https://www.douyin.com/user/example',
+        destination_names: ['销售群', '预约群'], sent_at: '2026-11-20T06:30:00+00:00',
+      })) : [];
+      return json({items, total: items.length, page: 1, pages: 1});
+    }
     const response = await previous(input, init);
     if (url.pathname === '/api/comment-watches' && method === 'GET') {
       const rows = await response.json();

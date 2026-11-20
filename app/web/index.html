@@ -3643,6 +3643,27 @@
       </div>
     </div>
   </div>
+  <div class="card" data-section="deliveries">
+    <div class="card-head">
+      <span class="card-ic"><svg aria-hidden="true"><use href="#i-send"/></svg></span>
+      <h2>推送记录</h2>
+    </div>
+    <div class="manage-toolbar">
+      <span class="filter-count" id="comment-delivery-status" role="status"></span>
+      <button type="button" class="ghost sm" onclick="refreshCommentDeliveries()"><svg aria-hidden="true"><use href="#i-refresh"/></svg>刷新推送记录</button>
+    </div>
+    <div class="table-wrap">
+      <table class="watch-record-table comment-delivery-table" aria-label="已成功推送的评论">
+        <thead><tr><th scope="col">评论</th><th scope="col">用户</th><th scope="col">作品</th><th scope="col">置信度 / 分组标签</th><th scope="col">渠道</th><th scope="col">时间</th></tr></thead>
+        <tbody id="comment-delivery-table"></tbody>
+      </table>
+    </div>
+    <nav class="comment-delivery-pager" id="comment-delivery-pager" aria-label="推送记录分页" hidden>
+      <button type="button" id="comment-delivery-prev" class="ghost sm" onclick="refreshCommentDeliveries(-1)"><svg aria-hidden="true"><use href="#i-prev"/></svg>上一页</button>
+      <span class="mut" id="comment-delivery-page"></span>
+      <button type="button" id="comment-delivery-next" class="ghost sm" onclick="refreshCommentDeliveries(1)">下一页<svg aria-hidden="true"><use href="#i-next"/></svg></button>
+    </nav>
+  </div>
   </section>
 
   <section data-panel="danmaku" class="dy-only">

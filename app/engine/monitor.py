@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from sqlmodel import select
-from sqlalchemy import or_
+from sqlalchemy import or_, update
 
 from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        fetch_creator_comments, fetch_danmaku, fetch_creator_danmaku,
@@ -57,6 +57,7 @@ from ..platforms.xhs import (parse_note_brief, parse_note_detail,
                    parse_self_user as parse_xhs_self_user,
                    XhsApiClient, XhsApiError, cookie_str_from_state, has_a1,
                    publish_xhs, creator_check, comment_xhs_browser)
+from ..platforms.xhs.resolve import note_url as xhs_note_url
 from ..platforms.kuaishou import (parse_ks_feed, parse_ks_comment,
                    flatten_ks_comments, parse_self_user as parse_ks_self_user,
                    publish_kuaishou)
@@ -68,6 +69,7 @@ from ..platforms.channels import (
     parse_self_user as parse_channels_self_user,
     publish_channels,
 )
+from ..platforms.channels.resolve import work_page_url as channels_work_url
 from ..platforms.tiktok import (TikTokNativeClient, parse_tiktok_aweme,
                                 parse_tiktok_comment, publish_tiktok,
                                 tiktok_display_text)
@@ -3515,14 +3517,19 @@ class MonitorEngine:
         return title
 
     async def _ingest(self, watch_id, aweme_id, fresh, name, work_desc, first_scan,
-                      platform="douyin") -> int:
+                      platform="douyin", *, work_url="") -> int:
         """fresh: parse_comment 结果(无 aweme_id)。入库 + 按时间水位线推送。"""
         from ..comment_ai import clean_work_title, enqueue
 
         work_desc = clean_work_title(work_desc, aweme_id)
-        if not fresh and not work_desc:
+        if not fresh and not work_desc and not work_url:
             return 0
         with get_session() as s:
+            if work_url:
+                s.execute(update(CommentRecord).where(
+                    CommentRecord.watch_id == watch_id, CommentRecord.platform == platform,
+                    CommentRecord.aweme_id == aweme_id, CommentRecord.work_url != work_url,
+                ).values(work_url=work_url))
             if work_desc:
                 watch = s.get(CommentWatch, watch_id)
                 if (watch and watch.kind == "video" and watch.aweme_id == aweme_id
@@ -3538,7 +3545,8 @@ class MonitorEngine:
             ai_rows = []
             for c in fresh:
                 record = CommentRecord(platform=platform, watch_id=watch_id,
-                                       aweme_id=aweme_id, **{**c, "work_title": work_desc or ""})
+                                       aweme_id=aweme_id, work_url=work_url,
+                                       **{**c, "work_title": work_desc})
                 s.add(record)
                 ai_rows.append(record)
             enqueue(s, ai_rows, automatic=True)
@@ -3738,6 +3746,7 @@ class MonitorEngine:
 
         resolved_oid = str(object_id or "").strip()
         resolved_nid = str(object_nonce_id or "").strip()
+        work_desc = self._comment_work_title("shipinhao", resolved_oid, work_desc)
         try:
             if proto_client is not None:
                 if not resolved_oid.isdecimal() or not resolved_nid:
@@ -3752,6 +3761,8 @@ class MonitorEngine:
                         )
                         resolved_nid = str(detail_obj.get("objectNonceId") or resolved_nid)
                         aw_detail = parse_channels_feed(detail_obj)
+                        if aw_detail:
+                            work_desc = work_desc or aw_detail.desc
                         with get_session() as s:
                             w = s.get(CommentWatch, watch_id)
                             if w:
@@ -3783,7 +3794,8 @@ class MonitorEngine:
                         fresh = [c for c in comments if c and c["comment_id"] not in known]
                         n = await self._ingest(
                             watch_id, resolved_oid, fresh, name,
-                            work_desc or name, first_scan, platform="shipinhao")
+                            work_desc, first_scan, platform="shipinhao",
+                            work_url=channels_work_url(resolved_oid, resolved_nid))
                         return n, None
         finally:
             if owns_client and proto_client is not None:
@@ -3808,8 +3820,9 @@ class MonitorEngine:
             if c and c["comment_id"] not in known
         ]
         n = await self._ingest(
-            watch_id, resolved_oid, fresh, name, work_desc or name,
-            first_scan, platform="shipinhao")
+            watch_id, resolved_oid, fresh, name, work_desc,
+            first_scan, platform="shipinhao",
+            work_url=channels_work_url(resolved_oid, resolved_nid) if resolved_nid else "")
         return n, None
 
     async def _cw_channels_user(self, watch_id, identity, state, user_id, name, first_scan):
@@ -3923,7 +3936,7 @@ class MonitorEngine:
                  if c and c["comment_id"] not in known]
         count = await self._ingest(
             watch_id, aweme_id, fresh, name, work_desc or metadata.get("title", ""), first_scan,
-            platform="tiktok")
+            platform="tiktok", work_url=target_url)
         return count, None
 
     async def _cw_tiktok_user(self, watch_id, identity, state, unique_id,
@@ -4051,9 +4064,10 @@ class MonitorEngine:
                     work_desc = card.get("title") or card.get("display_title") or card.get("desc") or ""
                 except Exception as exc:
                     log.debug("评论监控(小红书笔记)读取标题失败 %s: %s", note_id, exc)
+        work_url = xhs_note_url(note_id, xsec_token, xsec_source) if xsec_token else ""
         n = await self._ingest(watch_id, note_id, fresh, name,
                                work_desc or metadata.get("title", ""), first_scan,
-                               platform="xhs")
+                               platform="xhs", work_url=work_url)
         return n, None
 
     async def _cw_xhs_creator(
@@ -4097,6 +4111,8 @@ class MonitorEngine:
         total = 0
         for index, b in enumerate(briefs):
             nid = b["note_id"]
+            note_token = b.get("xsec_token", "")
+            note_source = b.get("xsec_source") or "pc_feed"
             with get_session() as s:
                 known = set(s.exec(select(CommentRecord.comment_id)
                                    .where(CommentRecord.watch_id == watch_id)
@@ -4106,8 +4122,7 @@ class MonitorEngine:
             if browser_reads:
                 raw, read_error = await fetch_xhs_comments(
                     self.browser, identity, nid, known,
-                    xsec_token=b.get("xsec_token", ""),
-                    xsec_source="pc_feed",
+                    xsec_token=note_token, xsec_source="pc_feed",
                     max_scrolls=settings["max_scrolls"],
                     block_media=self.cfg.engine.block_media_resources)
                 if read_error:
@@ -4119,9 +4134,11 @@ class MonitorEngine:
                 fresh = [c for c in fresh if c["comment_id"] not in known]
             else:
                 fresh = await self._xhs_fetch_comments(
-                    client, nid, b.get("xsec_token", ""), known)
-            total += await self._ingest(watch_id, nid, fresh, name, b.get("title", ""),
-                                        first_scan, platform="xhs")
+                    client, nid, note_token, known)
+            work_url = xhs_note_url(nid, note_token, note_source) if note_token else ""
+            total += await self._ingest(
+                watch_id, nid, fresh, name, b.get("title", ""), first_scan,
+                platform="xhs", work_url=work_url)
         author_dict = parse_xhs_self_user(author) if author else None
         return total, ({"nickname": author_dict["nickname"],
                         "avatar_thumb": {"url_list": [author_dict["avatar"]]}}

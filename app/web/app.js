@@ -2514,7 +2514,11 @@ function watchRecordSourceMarkup(kind, row) {
   const view = watchRecordConfig(kind), source = watchRecordSource(kind, row), id = Number(source.id);
   const label = esc(source.name), linked = Number.isSafeInteger(id) && id >= 0;
   const name = linked ? `<button type="button" class="content-source-link" onclick="showWatchRecords('${kind}',${id})" title="查看此来源的记录">${label}</button>` : `<span>${label}</span>`;
-  const work = row.aweme_id ? `<span class="watch-record-work">作品 ID：${esc(row.aweme_id)}</span>` : "";
+  const workUrl = kind === "comment" && row.aweme_id && row.work_url ? safeMediaUrl(row.work_url) : "";
+  const workId = esc(row.aweme_id);
+  const work = row.aweme_id ? `<span class="watch-record-work">作品 ID：${workUrl
+    ? `<a href="${esc(workUrl)}" target="_blank" rel="noopener noreferrer">${workId}</a>`
+    : workId}</span>` : "";
   if (kind === "comment") return `<div class="content-origin">${name}${work}</div>`;
   const detail = source.unassigned ? "来源监控信息未记录" : `${view.label}任务 #${id}${source.deleted ? " · 原任务已删除，历史记录保留" : source.kind === "user" ? " · 账号监控" : " · 作品监控"}`;
   return `<div class="content-origin"><span class="content-origin-label">来源任务</span>
@@ -9658,7 +9662,7 @@ async function loop() {
     overview: [refreshOverviewSummary, refreshOverviewChart],
     accounts: [refreshAccounts],
     monitors: [refreshMonitors, refreshContents],
-    comments: [refreshWatches, refreshComments],
+    comments: [refreshWatches, refreshComments, () => window.refreshCommentDeliveries?.()],
     danmaku: [refreshDanmakuWatches, refreshDanmaku],
     autocomment: [refreshCommentRules, refreshCommentTasks],
     publish: [refreshPublish],
@@ -9799,7 +9803,8 @@ window.CreatorHubBridge = {
     const refreshers = {
       overview: [refreshOverviewSummary, refreshOverviewChart, refreshTaskQueueBadge],
       accounts: [refreshAccounts, refreshBrowserRuntimes, refreshProxies],
-      monitors: [refreshMonitors, refreshContents], comments: [refreshWatches, refreshComments],
+      monitors: [refreshMonitors, refreshContents],
+      comments: [refreshWatches, refreshComments, () => window.refreshCommentDeliveries?.()],
       danmaku: [refreshDanmakuWatches, refreshDanmaku], collections: [refreshCollections],
       queue: [refreshTaskQueue], publish: [refreshPublish],
       autocomment: [refreshCommentRules, refreshCommentTasks],

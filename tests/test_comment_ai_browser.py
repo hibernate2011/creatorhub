@@ -87,6 +87,21 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
     assert parse_qs(report)["min_confidence"] == ["0.8"]
     assert_no_overflow(page, f"comment-ai-records-{width}")
     capture(page, f"comment-ai-records-{width}")
+    page.get_by_role("tab", name="推送记录", exact=True).click()
+    history = page.get_by_role("table", name="已成功推送的评论")
+    expect(history).to_be_visible()
+    for text in ("请问怎么预约？", "示例客户", "北京", "91.0%", "装修 / 咨询", "2026-11-20 14:00:00"):
+        expect(history).to_contain_text(text)
+    expect(history.locator("tbody tr")).to_have_count(1)
+    expect(history.locator('td[data-label="渠道"] .meta-chip')).to_have_text(["销售群", "预约群"])
+    expect(history.get_by_role("link", name="装修流程介绍")).to_have_attribute(
+        "href", "https://www.douyin.com/video/1234")
+    expect(history.get_by_role("link", name="用户主页")).to_have_attribute(
+        "href", "https://www.douyin.com/user/example")
+    expect(history.get_by_role("columnheader", name="平台", exact=True, include_hidden=True)).to_have_count(0)
+    assert_no_overflow(page, f"comment-deliveries-{width}")
+    page.locator('.pswitch [data-pf="xhs"]').click()
+    expect(history).to_contain_text("暂无成功推送的评论")
     assert errors == []
 
 
