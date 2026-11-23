@@ -103,6 +103,8 @@ function _moduleReportParams(module, full) {
     if (confidence !== '' && confidence != null) put("min_confidence", Number(confidence) / 100);
     put("sort", $("comment-sort") && $("comment-sort").value);
     for (const [key, value] of Object.entries(contentCaptureBounds("comment"))) put(key, value);
+  } else if (module === "comment-deliveries") {
+    for (const [key, value] of commentDeliveryFilterParams()) params.set(key, value);
   } else if (module === "danmaku-watches") {
     put("q", $("danmaku-watch-search") && $("danmaku-watch-search").value);
     put("group_name", $("danmaku-watch-group") && $("danmaku-watch-group").value);
@@ -125,6 +127,7 @@ const _reportLabels = {
   contents: "作品数据",
   "comment-watches": "评论监控",
   comments: "评论数据",
+  "comment-deliveries": "推送记录",
   "danmaku-watches": "弹幕监控",
   danmaku: "弹幕数据",
 };
@@ -156,6 +159,7 @@ async function exportModuleReport(module, full = false, explicitBtn = null) {
     contents: "/api/reports/contents.xlsx",
     "comment-watches": "/api/reports/comment-watches.xlsx",
     comments: "/api/reports/comments.xlsx",
+    "comment-deliveries": "/api/reports/comment-deliveries.xlsx",
     "danmaku-watches": "/api/reports/danmaku-watches.xlsx",
     danmaku: "/api/reports/danmaku.xlsx",
   };

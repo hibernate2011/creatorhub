@@ -108,7 +108,41 @@ def test_comment_ai_settings_selection_and_forward(ui, width, height):
         "评论时间 2026-11-20 14:00:00")
     expect(history.locator("td.watch-record-time")).not_to_contain_text("评论时间")
     expect(history.get_by_role("columnheader", name="平台", exact=True, include_hidden=True)).to_have_count(0)
+    page.locator("#comment-delivery-next").click()
+    expect(history).to_contain_text("第二页推送")
+    page.locator("#comment-delivery-group").locator("xpath=ancestor::details").locator("summary").click()
+    export = page.get_by_role("button", name="导出推送记录 Excel")
+    with page.expect_download() as download:
+        export.click()
+    assert download.value.suggested_filename == "fixture-deliveries.xlsx"
+    report_query = page.locator("html").get_attribute("data-fixture-ai-delivery-report")
+    assert parse_qs(report_query.removeprefix("?")) == {"platform": ["douyin"]}
+    for suffix, value in (("group", "装修"), ("tag", "咨询"), ("region", "北"), ("confidence", "90")):
+        field = page.locator(f"#comment-delivery-{suffix}")
+        field.fill(value)
+        field.press("Tab")
+    expect(history).to_contain_text("请问怎么预约？")
+    expect(page.locator("#comment-delivery-status")).to_have_text("共 1 条已推送评论")
+    expect(page.locator("#comment-delivery-pager")).to_be_hidden()
+    query = page.locator("html").get_attribute("data-fixture-ai-delivery-query")
+    assert parse_qs(query.removeprefix("?")) == {
+        "platform": ["douyin"], "page": ["1"], "group_name": ["装修"], "tag": ["咨询"],
+        "ip_label": ["北"], "min_confidence": ["0.9"],
+    }
+    with page.expect_download():
+        export.click()
+    report_query = page.locator("html").get_attribute("data-fixture-ai-delivery-report")
+    assert parse_qs(report_query.removeprefix("?")) == {
+        "platform": ["douyin"], "group_name": ["装修"], "tag": ["咨询"],
+        "ip_label": ["北"], "min_confidence": ["0.9"],
+    }
+    region = page.locator("#comment-delivery-region")
+    region.fill("上海")
+    region.press("Tab")
+    expect(history).to_contain_text("没有符合筛选条件的推送记录")
     assert_no_overflow(page, f"comment-deliveries-{width}")
+    page.locator('[data-section="deliveries"]').get_by_role("button", name="重置筛选").click()
+    expect(page.locator("#comment-delivery-status")).to_have_text("共 2 条已推送评论")
     page.locator('.pswitch [data-pf="xhs"]').click()
     expect(history).to_contain_text("暂无成功推送的评论")
     assert errors == []

@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import and_, case, func, update
 from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from .db import get_session
@@ -629,10 +630,8 @@ def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
             ).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         pass
-    group_tags = ""
-    if watch:
-        tags = "、".join(load_tags(watch.tags))
-        group_tags = " / ".join(filter(None, (watch.group_name, tags)))
+    group_name = watch.group_name if watch else ""
+    tags = load_tags(watch.tags) if watch else []
     work_url = (work_urls[row.platform] + quote(row.aweme_id, safe="")
                 if row.platform in work_urls and row.aweme_id else "")
     profile = row.user_profile_url
@@ -664,7 +663,9 @@ def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
             profile = build_rednote_profile_url(quote(row.user_sec_uid, safe=""))
     return {
         "confidence": f"{row.confidence:.1%}" if row.confidence is not None else "",
-        "group_tags": group_tags,
+        "group_name": group_name,
+        "tags": tags,
+        "group_tags": " / ".join(filter(None, (group_name, "、".join(tags)))),
         "user_nickname": row.user_nickname[:100],
         "ip_label": row.ip_label,
         "text": row.text[:1800],
@@ -840,20 +841,110 @@ async def worker(load_douyin_title: DouyinTitleLoader | None = None):
 router = APIRouter(prefix="/api/comment-ai", tags=["comment-ai"])
 
 
-@router.get("/deliveries")
-def list_deliveries(platform: str, page: Annotated[int, Query(ge=1)] = 1,
-                    page_size: Annotated[int, Query(ge=1, le=100)] = 20):
+def _delivery_metadata(message, watch_group, watch_tags):
+    if message and "tags" in message:
+        return message["group_name"], message["tags"]
+    tags = load_tags(watch_tags)
+    if not message:
+        return watch_group or "", tags
+    combined = message.get("group_tags", "")
+    if combined == " / ".join(filter(None, (watch_group, "、".join(tags)))):
+        return watch_group or "", tags
+    if not combined:
+        return "", []
+    group, separator, tag_text = combined.partition(" / ")
+    if separator:
+        return group, tag_text.split("、")
+    # A single legacy value can be either a group or a tag once the watch changes.
+    return (group, [group]) if "、" not in group else ("", group.split("、"))
+
+
+def _sent_deliveries(platform):
     delivery, analysis = CommentLeadDelivery, CommentAnalysis
-    sent = (select(delivery.analysis_id, func.max(delivery.updated_at).label("sent_at"))
+    return (select(delivery.analysis_id, func.max(delivery.updated_at).label("sent_at"))
             .join(analysis, delivery.analysis_id == analysis.id)
             .where(delivery.status == "sent", analysis.platform == platform)
             .group_by(delivery.analysis_id).subquery())
+
+
+def _latest_delivery_query(sent, platform):
+    delivery, analysis = CommentLeadDelivery, CommentAnalysis
+    # Each list row displays the most recent successful delivery across its channels.
+    latest = aliased(delivery)
+    latest_id = (select(latest.id).where(latest.analysis_id == sent.c.analysis_id, latest.status == "sent")
+                 .order_by(latest.updated_at.desc(), latest.id.desc()).limit(1).scalar_subquery())
+    return (select(sent.c.analysis_id, delivery.message_json, analysis.ip_label, analysis.confidence,
+                   CommentWatch.group_name, CommentWatch.tags)
+            .select_from(sent)
+            .join(delivery, delivery.id == latest_id)
+            .join(analysis, analysis.id == sent.c.analysis_id)
+            .outerjoin(CommentWatch, and_(CommentWatch.id == func.coalesce(delivery.watch_id, analysis.watch_id),
+                                          CommentWatch.platform == platform))
+            .order_by(sent.c.sent_at.desc(), sent.c.analysis_id.desc())
+            .execution_options(yield_per=200))
+
+
+def _matching_delivery_rows(rows, group_name, tag, ip_label, min_confidence):
+    group_name = " ".join(group_name.split()).casefold()
+    tag = " ".join(tag.split()).casefold()
+    ip_label = ip_label.strip().casefold()
+    for row in rows:
+        message = json.loads(row.message_json) if row.message_json else None
+        region = message.get("ip_label", "") if message is not None else row.ip_label
+        if ip_label and ip_label not in region.casefold():
+            continue
+        if min_confidence is not None:
+            score = message.get("confidence", "") if message is not None else (
+                f"{row.confidence:.1%}" if row.confidence is not None else "")
+            if not score or float(score.removesuffix("%")) / 100 < min_confidence:
+                continue
+        if group_name or tag:
+            group, tags = _delivery_metadata(message, row.group_name, row.tags)
+            if group_name and group_name != group.casefold():
+                continue
+            if tag and all(tag != value.casefold() for value in tags):
+                continue
+        yield row, message
+
+
+def delivery_report_items(platform, group_name, tag, ip_label, min_confidence):
+    query = _latest_delivery_query(_sent_deliveries(platform), platform).add_columns(
+        CommentAnalysis, CommentWatch, CommentLeadDelivery.updated_at)
     with get_session() as session:
-        total = session.exec(select(func.count()).select_from(sent)).one()
+        rows = _matching_delivery_rows(session.exec(query), group_name, tag, ip_label, min_confidence)
+        return [
+            {**(message if message is not None else lead_message_fields(row.CommentAnalysis, row.CommentWatch)),
+             "sent_at": row.updated_at.replace(tzinfo=timezone.utc)}
+            for row, message in rows
+        ]
+
+
+@router.get("/deliveries")
+def list_deliveries(platform: str, page: Annotated[int, Query(ge=1)] = 1,
+                    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+                    group_name: str = "", tag: str = "", ip_label: str = "",
+                    min_confidence: Annotated[float | None, Query(ge=0, le=1)] = None):
+    delivery, analysis = CommentLeadDelivery, CommentAnalysis
+    sent = _sent_deliveries(platform)
+    with get_session() as session:
+        matching_ids = None
+        if group_name.strip() or tag.strip() or ip_label.strip() or min_confidence is not None:
+            # Keep matching and page hydration on the same SQLite read snapshot.
+            session.connection().exec_driver_sql("BEGIN")
+            candidates = session.exec(_latest_delivery_query(sent, platform))
+            matching_ids = [row.analysis_id for row, _ in
+                            _matching_delivery_rows(candidates, group_name, tag, ip_label, min_confidence)]
+        total = len(matching_ids) if matching_ids is not None else session.exec(
+            select(func.count()).select_from(sent)).one()
         pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, pages)
-        page_comments = (select(sent).order_by(sent.c.sent_at.desc(), sent.c.analysis_id.desc())
-                         .offset((page - 1) * page_size).limit(page_size).subquery())
+        offset = (page - 1) * page_size
+        page_comments = select(sent).order_by(sent.c.sent_at.desc(), sent.c.analysis_id.desc())
+        if matching_ids is None:
+            page_comments = page_comments.offset(offset).limit(page_size)
+        else:
+            page_comments = page_comments.where(sent.c.analysis_id.in_(matching_ids[offset:offset + page_size]))
+        page_comments = page_comments.subquery()
         rows = session.exec(
             select(delivery, analysis).join(analysis, delivery.analysis_id == analysis.id)
             .join(page_comments, page_comments.c.analysis_id == delivery.analysis_id)
@@ -866,7 +957,8 @@ def list_deliveries(platform: str, page: Annotated[int, Query(ge=1)] = 1,
         watch_ids = {a.watch_id if d.watch_id is None else d.watch_id for d, a in legacy} - {0}
         watches = {}
         if watch_ids:
-            watches = {w.id: w for w in session.exec(select(CommentWatch).where(CommentWatch.id.in_(watch_ids)))}
+            watches = {w.id: w for w in session.exec(select(CommentWatch).where(
+                CommentWatch.id.in_(watch_ids), CommentWatch.platform == platform))}
         names = {d["id"]: d["name"] for d in settings(session)["destinations"]} if legacy else {}
         for watch in watches.values():
             names.update({f"watch:{watch.id}:{d['id']}": d["name"] for d in watch_policy(watch)["destinations"]})

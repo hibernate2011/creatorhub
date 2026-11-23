@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -379,6 +380,10 @@ class CommentAITests(unittest.TestCase):
         self.assertEqual(row["destination_names"], ["预约群", "销售群"])
         self.assertTrue(row["sent_at"].endswith("+00:00"))
         self.assertNotIn("platform", row)
+        self.assertEqual(ai.list_deliveries("douyin", group_name="装修", tag="预约",
+                                           ip_label="北", min_confidence=.9)["items"], [row])
+        self.assertEqual(ai.list_deliveries("douyin", ip_label="上海")["total"], 0)
+        self.assertEqual(ai.list_deliveries("douyin", tag="约")["total"], 0)
 
     def test_leads_keep_platform_links_in_delivery_history(self):
         cases = [
@@ -464,6 +469,132 @@ class CommentAITests(unittest.TestCase):
                 self.assertEqual(first["items"][0]["destination_names"], ["销售群", "未知渠道"])
                 self.assertEqual(other["total"], 1)
                 self.assertEqual(other["items"][0]["work_url"], "https://www.xiaohongshu.com/explore/w1")
+        asyncio.run(run())
+
+    def test_delivery_history_filters_the_latest_success_before_pagination(self):
+        from app.main import app
+
+        with db.get_session() as session:
+            watch = CommentWatch(group_name="装修", tags='["咨询"]')
+            session.add(watch)
+            session.commit()
+            watch_id = watch.id
+        _, latest = self.add(comment_id="latest", ip_label="上海")
+        _, legacy_snapshot = self.add(comment_id="snapshot", ip_label="上海")
+        _, legacy_watch = self.add(comment_id="watch", watch_id=watch_id, ip_label="北京")
+        _, other_platform = self.add(comment_id="other", platform="xhs")
+        now = datetime(2026, 11, 20)
+        with db.get_session() as session:
+            for key in (latest, legacy_snapshot, legacy_watch, other_platform):
+                session.get(CommentAnalysis, key).confidence = .95
+            snapshot = {"group_tags": "装修 / 咨询、预约", "ip_label": "北京", "confidence": "85.0%"}
+            for seconds, key, message in (
+                (1, legacy_watch, None),
+                (2, latest, snapshot),
+                (3, legacy_snapshot, snapshot),
+                (4, latest, {**snapshot, "group_name": "设计", "tags": ["咨询 / 预约"],
+                             "group_tags": "设计 / 咨询 / 预约", "ip_label": "上海", "confidence": "95.0%"}),
+                (5, other_platform, snapshot),
+            ):
+                session.add(CommentLeadDelivery(
+                    id=f"sent-{seconds}", analysis_id=key, status="sent",
+                    updated_at=now + timedelta(seconds=seconds),
+                    message_json=json.dumps(message, ensure_ascii=False) if message else "",
+                ))
+            session.commit()
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+                path = "/api/comment-ai/deliveries"
+                params = {"platform": "douyin", "group_name": "装修", "tag": "咨询",
+                          "ip_label": "北京", "min_confidence": .85, "page_size": 1}
+                response = await client.get(path, params=params)
+                self.assertEqual(response.status_code, 200)
+                first = response.json()
+                self.assertEqual((first["total"], first["page"], first["pages"]), (2, 1, 2))
+                self.assertEqual(first["items"][0]["confidence"], "85.0%")
+                second = (await client.get(path, params={**params, "page": 2})).json()
+                self.assertEqual(second["items"][0]["confidence"], "95.0%")
+                higher = (await client.get(path, params={**params, "min_confidence": .9, "page": 2})).json()
+                self.assertEqual((higher["total"], higher["page"], higher["pages"]), (1, 1, 1))
+                structured = (await client.get(path, params={"platform": "douyin", "tag": "咨询 / 预约"})).json()
+                self.assertEqual(structured["total"], 1)
+                self.assertEqual(structured["items"][0]["ip_label"], "上海")
+                self.assertEqual((await client.get(path, params={**params, "min_confidence": 2})).status_code, 422)
+
+        asyncio.run(run())
+
+    def test_delivery_report_exports_all_filtered_pages_without_channel(self):
+        from openpyxl import load_workbook
+
+        from app.main import app
+        from app.reporting import REPORT_MIME
+
+        now = datetime(2026, 11, 20)
+        snapshot = {
+            "confidence": "91.0%", "group_name": "装修", "tags": ["咨询"], "group_tags": "装修 / 咨询",
+            "ip_label": "北京", "work_url": "https://www.douyin.com/video/1234",
+            "user_profile_url": "https://www.douyin.com/user/example", "destination_name": "销售群",
+            "comment_time": "2026-11-20 14:00:00",
+        }
+        with db.get_session() as session:
+            watch = CommentWatch(group_name="装修", tags='["咨询"]')
+            session.add(watch)
+            session.flush()
+            records = [("douyin", "sent", {}) for _ in range(22)] + [
+                ("xhs", "sent", {}),
+                ("douyin", "failed", {}),
+                ("douyin", "sent", {"ip_label": "上海"}),
+                ("douyin", "sent", {"group_name": "设计"}),
+                ("douyin", "sent", {"tags": ["设计"]}),
+                ("douyin", "sent", {"confidence": "89.0%"}),
+            ]
+            for index, (platform, status, overrides) in enumerate(records):
+                key = str(index)
+                session.add(CommentAnalysis(id=key, platform=platform, aweme_id="1234", comment_id=key,
+                                            watch_id=watch.id, confidence=.91, ip_label="北京", text=f"评论 {index}"))
+                message = {**snapshot, **overrides, "text": f"评论 {index}"}
+                session.add(CommentLeadDelivery(
+                    id=key, analysis_id=key, status=status, updated_at=now + timedelta(seconds=index),
+                    message_json=json.dumps(message, ensure_ascii=False) if index else "",
+                ))
+            session.add(CommentLeadDelivery(
+                id="second-channel", analysis_id="21", status="sent", updated_at=now + timedelta(seconds=40),
+                message_json=json.dumps({**snapshot, "text": "=评论 21", "destination_name": "预约群"}, ensure_ascii=False),
+            ))
+            session.commit()
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+                params = {"platform": "douyin", "group_name": "装修", "tag": "咨询",
+                          "ip_label": "北", "min_confidence": .9}
+                list_path = "/api/comment-ai/deliveries"
+                first = (await client.get(list_path, params=params)).json()
+                second = (await client.get(list_path, params={**params, "page": 2})).json()
+                self.assertEqual((first["total"], len(first["items"]), len(second["items"])), (22, 20, 2))
+                path = "/api/reports/comment-deliveries.xlsx"
+                response = await client.get(path, params={**params, "page": 2})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["content-type"], REPORT_MIME)
+                self.assertIn('attachment; filename="creatorhub_comment_deliveries_', response.headers["content-disposition"])
+                book = load_workbook(BytesIO(response.content))
+                sheet = book["推送记录"]
+                self.assertEqual(sheet.max_row, 23)
+                self.assertFalse(any("渠道" in cell.value for cell in sheet[1]))
+                self.assertEqual(sheet["A2"].value, "'=评论 21")
+                self.assertEqual(sheet["A2"].data_type, "s")
+                self.assertEqual(sheet["B2"].value, datetime(2026, 11, 20, 14))
+                self.assertEqual(sheet["F2"].hyperlink.target, snapshot["user_profile_url"])
+                self.assertEqual(sheet["H2"].hyperlink.target, snapshot["work_url"])
+                self.assertEqual((sheet["I2"].value, sheet["I2"].number_format), (.91, "0.0%"))
+                self.assertEqual([row[0].value for row in sheet.iter_rows(min_row=3)],
+                                 [item["text"] for item in first["items"][1:] + second["items"]])
+
+                empty = await client.get(path, params={**params, "ip_label": "广州"})
+                self.assertEqual(load_workbook(BytesIO(empty.content))["推送记录"].max_row, 1)
+                unfiltered = await client.get(path, params={"platform": "douyin"})
+                self.assertEqual(load_workbook(BytesIO(unfiltered.content))["推送记录"].max_row, 27)
+
         asyncio.run(run())
 
     def test_lead_message_links_and_omits_internal_fields(self):

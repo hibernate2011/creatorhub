@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.hyperlink import Hyperlink
@@ -68,7 +69,7 @@ def _text(value: Any) -> str:
     """
     if value is None:
         return ""
-    result = str(value)
+    result = ILLEGAL_CHARACTERS_RE.sub("", str(value))
     if result[:1] in ("=", "+", "-", "@"):
         return "'" + result
     return result
@@ -741,6 +742,46 @@ def build_comments_report(
         freeze_panes="F2",
         row_height=36,
         generated_at=generated_at,
+    )
+
+
+def _comment_delivery_row(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    confidence = row.get("confidence", "")
+    comment_time = row.get("comment_time", "")
+    if comment_time and comment_time != "未知":
+        comment_time = datetime.fromisoformat(comment_time)
+    profile_url = row.get("user_profile_url", "")
+    work_url = row.get("work_url", "")
+    return (
+        row.get("text", ""), comment_time, row.get("user_nickname", ""),
+        row.get("ip_label", ""), row.get("user_id", ""),
+        profile_url if profile_url.lower().startswith(("http://", "https://")) else "",
+        row.get("work_title", ""), work_url if work_url.lower().startswith(("http://", "https://")) else "",
+        float(confidence.removesuffix("%")) / 100 if confidence else None,
+        row.get("group_tags", ""), _excel_datetime(row["sent_at"]),
+    )
+
+
+def build_comment_deliveries_report(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    filters: Sequence[tuple[str, Any]] = (),
+) -> bytes:
+    return build_module_report(
+        report_title="CreatorHub 推送记录报告",
+        module_name="推送记录",
+        sheet_title="推送记录",
+        headers=("评论内容", "评论时间", "用户昵称", "地区", "用户 ID", "用户主页",
+                 "作品名称", "作品链接", "潜客置信度", "分组标签", "最近推送时间"),
+        rows=(_comment_delivery_row(row) for row in items),
+        filters=filters,
+        widths=(54, 22, 24, 16, 24, 40, 38, 42, 16, 28, 22),
+        date_columns={2, 11},
+        number_columns={9},
+        number_formats={9: "0.0%"},
+        link_columns={6, 8},
+        tab_color="14B8A6",
+        row_height=36,
     )
 
 

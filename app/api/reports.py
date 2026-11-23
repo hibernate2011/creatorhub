@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import or_
 from sqlmodel import select
@@ -561,6 +561,29 @@ async def export_comments_report(
         ]),
     )
     return metadata_service._report_download(payload, "comments")
+
+
+@router.get("/api/reports/comment-deliveries.xlsx")
+def export_comment_deliveries_report(
+    platform: str,
+    group_name: str = "",
+    tag: str = "",
+    ip_label: str = "",
+    min_confidence: Annotated[float | None, Query(ge=0, le=1)] = None,
+):
+    from app.comment_ai import delivery_report_items
+    from app.reporting import build_comment_deliveries_report
+
+    items = delivery_report_items(platform, group_name, tag, ip_label, min_confidence)
+    payload = build_comment_deliveries_report(
+        items,
+        filters=_report_filter_pairs([
+            ("导出范围", "当前筛选结果"), ("平台", platform),
+            ("分组", group_name.strip()), ("标签", tag.strip()), ("地区", ip_label.strip()),
+            ("最低潜客置信度", f"{min_confidence * 100:g}%" if min_confidence is not None else ""),
+        ]),
+    )
+    return metadata_service._report_download(payload, "comment_deliveries")
 
 
 @router.get("/api/reports/danmaku.xlsx")

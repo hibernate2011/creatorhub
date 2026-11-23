@@ -294,7 +294,15 @@
       <h2>推送记录</h2>
     </div>
     <div class="manage-toolbar">
-      <span class="filter-count" id="comment-delivery-status" role="status"></span>
+      <input id="comment-delivery-group" type="text" maxlength="40" placeholder="分组名称" aria-label="按分组筛选推送记录" onchange="refreshCommentDeliveries()">
+      <input id="comment-delivery-tag" type="text" maxlength="24" placeholder="标签名称" aria-label="按标签筛选推送记录" onchange="refreshCommentDeliveries()">
+      <input id="comment-delivery-region" type="text" maxlength="64" placeholder="评论地区" aria-label="按地区筛选推送记录" onchange="refreshCommentDeliveries()">
+      <input id="comment-delivery-confidence" type="number" min="0" max="100" step="any" placeholder="最低置信度 %" aria-label="推送记录最低置信度百分比" onchange="refreshCommentDeliveries()">
+      <span class="filter-count" id="comment-delivery-status" role="status" aria-live="polite"></span>
+      <div class="export-actions" role="group" aria-label="推送记录 Excel 导出">
+        <span class="export-caption"><svg aria-hidden="true"><use href="#i-download"/></svg>Excel</span>
+        <button type="button" class="export-btn filtered" onclick="exportModuleReport('comment-deliveries', false, this)" title="导出当前条件下的全部匹配记录" aria-label="导出推送记录 Excel"><svg aria-hidden="true"><use href="#i-download"/></svg>当前结果</button>
+      </div>
       <button type="button" class="ghost sm" onclick="refreshCommentDeliveries()"><svg aria-hidden="true"><use href="#i-refresh"/></svg>刷新推送记录</button>
     </div>
     <div class="table-wrap">

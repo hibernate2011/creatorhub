@@ -5,6 +5,7 @@ let COMMENT_AI_POLL = null;
 let COMMENT_AI_FIELD = 0;
 let COMMENT_DELIVERY_PAGE = 1;
 let COMMENT_DELIVERY_PLATFORM = "";
+let COMMENT_DELIVERY_FILTERS = "";
 let COMMENT_DELIVERY_REQUEST = null;
 const COMMENT_DELIVERY_COLUMNS = 6;
 
@@ -36,26 +37,48 @@ function commentDeliveryRow(row) {
   </tr>`;
 }
 
+function commentDeliveryFilterParams() {
+  const params = new URLSearchParams();
+  for (const [key, suffix] of [["group_name", "group"], ["tag", "tag"], ["ip_label", "region"]]) {
+    const value = $("comment-delivery-" + suffix).value.trim();
+    if (value) params.set(key, value);
+  }
+  const confidence = $("comment-delivery-confidence");
+  if (confidence.value !== "") {
+    const entered = confidence.valueAsNumber;
+    const percent = Math.max(0, Math.min(100, entered));
+    if (percent !== entered) confidence.value = String(percent);
+    params.set("min_confidence", percent / 100);
+  }
+  return params;
+}
+
 async function refreshCommentDeliveries(pageDelta = 0) {
   const table = $("comment-delivery-table");
   if (CURRENT_TAB !== "comments" || table?.closest(".wb-tabpanel")?.hidden !== false) return;
   const status = $("comment-delivery-status"), pager = $("comment-delivery-pager");
-  if (COMMENT_DELIVERY_PLATFORM !== PLATFORM) {
+  const params = commentDeliveryFilterParams();
+  const filters = params.toString();
+  const resetPage = COMMENT_DELIVERY_PLATFORM !== PLATFORM || COMMENT_DELIVERY_FILTERS !== filters;
+  if (resetPage) {
     COMMENT_DELIVERY_PLATFORM = PLATFORM;
+    COMMENT_DELIVERY_FILTERS = filters;
     COMMENT_DELIVERY_PAGE = 1;
     table.innerHTML = skeleton(COMMENT_DELIVERY_COLUMNS);
     status.textContent = "正在读取推送记录";
     pager.hidden = true;
   }
-  if (!pageDelta && COMMENT_DELIVERY_REQUEST?.()) return;
+  if (!resetPage && !pageDelta && COMMENT_DELIVERY_REQUEST?.()) return;
   const isCurrent = beginViewRequest("comment-deliveries");
   COMMENT_DELIVERY_REQUEST = isCurrent;
   try {
-    const params = new URLSearchParams({platform: PLATFORM, page: String(COMMENT_DELIVERY_PAGE + pageDelta)});
+    params.set("platform", PLATFORM);
+    params.set("page", resetPage ? 1 : COMMENT_DELIVERY_PAGE + pageDelta);
     const data = await api("/api/comment-ai/deliveries?" + params);
     if (!isCurrent()) return;
     COMMENT_DELIVERY_PAGE = data.page;
-    const html = data.items.map(commentDeliveryRow).join("") || empty(COMMENT_DELIVERY_COLUMNS, "暂无成功推送的评论", "i-send");
+    const emptyLabel = filters ? "没有符合筛选条件的推送记录" : "暂无成功推送的评论";
+    const html = data.items.map(commentDeliveryRow).join("") || empty(COMMENT_DELIVERY_COLUMNS, emptyLabel, "i-send");
     if (table.innerHTML !== html) table.innerHTML = html;
     const count = `共 ${fmtNum(data.total)} 条已推送评论`;
     if (status.textContent !== count) status.textContent = count;
