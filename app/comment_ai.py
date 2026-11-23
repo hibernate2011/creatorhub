@@ -32,6 +32,8 @@ from .notifier.rate_limit import WebhookBusy, WebhookRateLimited, robot_key, web
 from .platforms.bilibili.resolve import work_page_url as bili_work_url
 from .platforms.instagram.resolve import clean_ig_username, work_page_url as ig_work_url
 from .platforms.rednote.resolve import build_rednote_note_url, build_rednote_profile_url
+from .platforms.twitter.resolve import clean_twitter_username, resolve_twitter_tweet_ref
+from .platforms.twitter.urls import profile_url as twitter_profile_url, tweet_url as twitter_tweet_url
 
 log = logging.getLogger(__name__)
 MODEL = "google/gemini-decision-1"
@@ -65,7 +67,7 @@ class PromptIn(BaseModel):
     text: str = Field(min_length=1, max_length=12000)
     exclude_keywords: list[str] = Field(default_factory=list)
     version: int = 1
-    platform: Literal["", "douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram"] = ""
+    platform: Literal["", "douyin", "xhs", "rednote", "kuaishou", "shipinhao", "tiktok", "bilibili", "instagram", "twitter"] = ""
     watch_ids: list[int] = Field(default_factory=list, max_length=500)
     work_ids: list[str] = Field(default_factory=list, max_length=500)
     groups: list[str] = Field(default_factory=list, max_length=100)
@@ -287,9 +289,9 @@ def clean_work_title(value: str, aweme_id: str) -> str:
     title = value.strip() if isinstance(value, str) else ""
     if title == aweme_id or any(title == f"{label} {aweme_id}"
                                  for label in ("视频", "作品", "笔记", "视频号作品", "B站稿件",
-                                               "IG p", "IG reel", "IG tv", "IG story")):
+                                               "IG p", "IG reel", "IG tv", "IG story", "推文")):
         return ""
-    if title.startswith("@") and title.partition(" ")[2] == f"视频 {aweme_id}":
+    if title.startswith("@") and title.partition(" ")[2] in {f"视频 {aweme_id}", f"推文 {aweme_id}"}:
         return ""
     return title
 
@@ -304,8 +306,8 @@ def find_work_title(session, platform: str, aweme_id: str, saved_title: str = ""
         (ContentRecord, ContentRecord.desc, ContentRecord.aweme_id),
         (AccountWork, AccountWork.desc, AccountWork.item_id),
     )
-    # Instagram watch names can include the creator's display name.
-    for model, column, work_id in ((recorded_title, *sources) if platform == "instagram"
+    # Instagram and X watch names can include the creator's display name.
+    for model, column, work_id in ((recorded_title, *sources) if platform in {"instagram", "twitter"}
                                    else (*sources, recorded_title)):
         candidates = session.exec(select(column).where(
             model.platform == platform, work_id == aweme_id, column != ""
@@ -338,7 +340,7 @@ def enqueue(session, rows, *, automatic=False):
         key = analysis_id(row)
         existing = session.get(CommentAnalysis, key) if row.comment_id else None
         region = (row.ip_label or "").strip()
-        work_url = row.work_url if row.platform == "instagram" else ""
+        work_url = row.work_url if row.platform in {"instagram", "twitter"} else ""
         if existing:
             if not existing.comment_create_time and row.create_time:
                 existing.comment_create_time = row.create_time
@@ -647,6 +649,15 @@ def lead_message_fields(row, watch: CommentWatch | None = None) -> dict:
         work_url = ig_work_url(row.aweme_id, source_url)
         if not profile and (username := clean_ig_username(row.user_sec_uid)):
             profile = f"https://www.instagram.com/{username}/"
+    elif row.platform == "twitter":
+        same_work = watch and watch.platform == row.platform and watch.kind == "video" and watch.aweme_id == row.aweme_id
+        ref = resolve_twitter_tweet_ref(row.work_url or (watch.work_url if same_work else ""))
+        if row.aweme_id:
+            screen_name = ref.screen_name if ref and ref.tweet_id == row.aweme_id else (watch.sec_uid if same_work else "")
+            work_url = twitter_tweet_url(row.aweme_id, screen_name)
+        if not profile and (username := clean_twitter_username(row.user_sec_uid) or
+                            (row.user_sec_uid if row.user_sec_uid.isascii() and row.user_sec_uid.isdigit() else "")):
+            profile = twitter_profile_url(username)
     elif row.platform == "rednote":
         work_url = build_rednote_note_url(quote(row.aweme_id, safe=""))
         if not profile:
@@ -689,7 +700,7 @@ def _fill_missing_comment_metadata(session, analysis):
         CommentRecord.aweme_id == analysis.aweme_id,
         CommentRecord.comment_id == analysis.comment_id,
     )
-    if analysis.platform == "instagram" and not analysis.work_url:
+    if analysis.platform in {"instagram", "twitter"} and not analysis.work_url:
         work_url = session.exec(select(CommentRecord.work_url).where(
             *source_match, CommentRecord.work_url != "",
         ).order_by(CommentRecord.id)).first()

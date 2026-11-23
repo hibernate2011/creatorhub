@@ -215,7 +215,7 @@ class CommentAITests(unittest.TestCase):
                 self.assertFalse(session.exec(select(CommentLeadDelivery)).all())
 
     def test_model_exclusion_uses_prompt_snapshot_and_controls_forwarding(self):
-        from app.main import list_comments
+        from app.api.comments import list_comments
 
         self.config["destinations"][0]["threshold"] = 0
         self.config["prompts"][0]["exclude_keywords"] = [" 二手车 ", "二手车", ""]
@@ -386,6 +386,8 @@ class CommentAITests(unittest.TestCase):
              "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
             ("instagram", "DdL0sPNt5jn", "buyer.a", "",
              "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+            ("twitter", "1900000000000000000", "buyer_x", "Seattle",
+             "https://x.com/fixture_author/status/1900000000000000000", "https://x.com/buyer_x"),
             ("rednote", "67a1b2c3d4e5f60000000001", "67a1b2c3d4e5f60000000002", "加拿大",
              "https://www.rednote.com/zh/discovery/item/67a1b2c3d4e5f60000000001",
              "https://www.rednote.com/zh/user/profile/67a1b2c3d4e5f60000000002"),
@@ -399,7 +401,7 @@ class CommentAITests(unittest.TestCase):
             comments = [
                 CommentRecord(platform=platform, aweme_id=work_id, comment_id="shared-id",
                               text="多少钱？", work_title="作品真实标题", user_sec_uid=user,
-                              ip_label=region, work_url=work_url if platform == "instagram" else "")
+                              ip_label=region, work_url=work_url if platform in {"instagram", "twitter"} else "")
                 for platform, work_id, user, region, work_url, _ in cases
             ]
             session.add_all(comments)
@@ -582,7 +584,7 @@ class CommentAITests(unittest.TestCase):
             self.assertTrue(await ai.process_batch(engine.load_douyin_comment_title))
 
         detail = AsyncMock(return_value=({"aweme_id": work_id, "desc": title}, ""))
-        with self.client(handler), patch("app.engine.monitor.fetch_douyin_video_detail", detail):
+        with self.client(handler), patch("app.engine.comment_watches.fetch_douyin_video_detail", detail):
             asyncio.run(run())
         detail.assert_awaited_once()
         self.assertEqual(detail.await_args.args[2], work_id)
@@ -705,7 +707,7 @@ class CommentAITests(unittest.TestCase):
             self.assertIn("作品链接：https://www.douyin.com/video/w1", body)
 
         raw_comment = {"cid": "new", "text": "怎么预约", "create_time": 1}
-        with patch("app.engine.monitor.fetch_comments", AsyncMock(return_value=([raw_comment], ""))):
+        with patch("app.engine.comment_watches.fetch_comments", AsyncMock(return_value=([raw_comment], ""))):
             self.assertEqual(asyncio.run(engine._cw_video(watch_id, None, "w1", "装修服务真实标题", True)), (1, None))
         with db.get_session() as session:
             row = session.exec(select(CommentRecord).where(CommentRecord.comment_id == "new")).one()
@@ -726,7 +728,7 @@ class CommentAITests(unittest.TestCase):
         self.assertFalse(asyncio.run(ai.process_batch()))
 
     def test_list_filters_pagination_and_unanalyzed(self):
-        from app.main import list_comments
+        from app.api.comments import list_comments
         self.add("a")
         self.add("b")
         self.analyze_all(.81)
@@ -833,7 +835,7 @@ class CommentAITests(unittest.TestCase):
         self.assertNotIn("test-secret", ai.redact_detail("feishu", self.config["destinations"][0], "invalid test-secret"))
 
     def test_export_matches_confidence_filter(self):
-        from app.main import export_comments_report
+        from app.api.reports import export_comments_report
         self.add()
         self.analyze_all(.9)
         self.add("unanalyzed", enqueue=False)
@@ -949,7 +951,7 @@ class CommentAITests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
 
     def test_watch_override_uses_custom_channel_and_reuses_analysis_across_watches(self):
-        from app.main import WatchUpdate, update_watch
+        from app.api.comments import WatchUpdate, update_watch
         self.config.update(auto_analyze=False, auto_forward=False)
         self.save()
         with db.get_session() as session:
@@ -1009,7 +1011,7 @@ class CommentAITests(unittest.TestCase):
             self.assertEqual(session.get(CommentLeadDelivery, f"{key}:watch:{watch_id}:branch").status, "sent")
 
     def test_watch_disable_blocks_automatic_work_and_pending_push(self):
-        from app.main import WatchUpdate, update_watch
+        from app.api.comments import WatchUpdate, update_watch
         with db.get_session() as session:
             watch = CommentWatch(title="店铺")
             session.add(watch)

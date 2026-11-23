@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 
 import pytest
 from patchright.sync_api import expect
-from test_web_appearance_browser import ui, navigate, assert_editor_layout, assert_no_overflow, capture
+from comment_ai_browser_fixture import ui, navigate, assert_editor_layout, assert_no_overflow, capture
 
 pytestmark = [pytest.mark.local_cdp, pytest.mark.skipif(
     os.environ.get("CREATORHUB_RUN_LOCAL_CDP") != "1", reason="local UI acceptance is opt-in")]
@@ -207,4 +207,89 @@ def test_collection_result_opens_single_work_comment_watch(ui, width, height):
     policy = posted["ai_policy"]
     assert (policy["auto_analyze"], policy["auto_forward"], policy["destination_mode"]) == ("on", "on", "custom")
     assert (policy["destinations"][0]["name"], policy["destinations"][0]["threshold"]) == ("门店群", .85)
+    assert errors == []
+
+
+@pytest.mark.parametrize("platform,account_id,video,profile", [
+    ("douyin", "1", "https://www.douyin.com/video/1234567890123456789", "https://www.douyin.com/user/test-profile"),
+    ("bilibili", "6", "https://www.bilibili.com/opus/1077998733285138440", "https://space.bilibili.com/12345"),
+    ("twitter", "9", "https://x.com/fixture_author/status/1900000000000000000", "https://x.com/fixture_author"),
+    ("instagram", "8", "https://www.instagram.com/reel/DdL0sPNt5jn/", "https://www.instagram.com/buyer.a/"),
+    ("rednote", "7", "https://www.rednote.com/zh/discovery/item/67a1b2c3d4e5f60000000001",
+     "https://www.rednote.com/zh/user/profile/67a1b2c3d4e5f60000000002"),
+])
+def test_workbench_batch_comment_watches_keep_failed_lines_for_retry(ui, platform, account_id, video, profile):
+    page, errors = ui
+    page.set_default_timeout(8000)
+    page.evaluate("values => Object.assign(document.documentElement.dataset, values)",
+                  {"platform": platform, "video": video, "profile": profile})
+    page.add_script_tag(content="""{
+      const originalFetch = window.fetch;
+      const created = [];
+      const submitted = [];
+      const {platform, video, profile} = document.documentElement.dataset;
+      const json = (data, status = 200) => new Response(JSON.stringify(data), {status});
+      window.fetch = (path, opts = {}) => {
+        if (path === "/api/share-download/links") {
+          const {share_text} = JSON.parse(opts.body);
+          const url = [video, profile].find(link => share_text.includes(link));
+          return Promise.resolve(json({links: url ? [{url, platform}] : []}));
+        }
+        if (path === "/api/comment-watches" && opts.method === "POST") {
+          const body = JSON.parse(opts.body);
+          submitted.push(body);
+          document.documentElement.dataset.batchSubmitted = JSON.stringify(submitted);
+          if (body.url_or_id === "invalid") return Promise.resolve(json({detail: "目标无效"}, 400));
+          if (created.some(w => w.url_or_id === body.url_or_id)) {
+            return Promise.resolve(json({detail: "已存在相同的评论监控"}, 409));
+          }
+          const watch = {...body, id: created.length + 1, title: body.url_or_id, enabled: true,
+            kind: body.url_or_id === video ? "video" : "user"};
+          created.push(watch);
+          return Promise.resolve(json(watch));
+        }
+        if (path === "/api/comment-watches?platform=" + platform) return Promise.resolve(json(created));
+        return originalFetch(path, opts);
+      };
+    }""")
+    if platform != "douyin":
+        page.locator(f'[data-pf="{platform}"]').first.click()
+    navigate(page, "comments")
+    page.locator("#wb-create").click()
+    targets = page.locator("#w-url")
+    targets.fill(f"作品分享 {video}")
+    targets.press("End")
+    targets.press("Enter")
+    assert targets.input_value().endswith("\n")
+    assert page.locator("html").get_attribute("data-batch-submitted") is None
+    targets.fill(f"作品分享 {video}\n \n{profile}\ninvalid\n{video}")
+    page.get_by_role("button", name="识别并清洗评论监控分享文案").click()
+    feedback = page.locator("#w-url-feedback")
+    expect(feedback).to_contain_text("已识别 3 条链接")
+    assert targets.input_value() == f"{video}\n \n{profile}\ninvalid\n{video}"
+
+    if platform in {"instagram", "rednote", "twitter"}:
+        expect(page.locator("#w-acc")).to_have_value(account_id)
+    page.locator("#w-acc").select_option(account_id, force=True)
+    page.locator('.wb-sheet [data-composer="comments"] .wb-optional > summary').click()
+    page.locator("#w-alias").fill("同批监控")
+    submit = page.get_by_role("button", name="开始监控评论", exact=True)
+    submit.click()
+    expect(feedback).to_have_text("原第 4 行 · 目标无效")
+    assert targets.input_value() == "invalid"
+    assert page.locator("#w-msg").inner_text() == "已添加 2 条，1 条已存在，1 条失败"
+    assert page.locator("#w-alias").input_value() == "同批监控"
+
+    targets.fill("@retry")
+    submit.click()
+    page.locator(".wb-sheet").wait_for(state="hidden")
+    page.locator("#watch-table tr").nth(2).wait_for()
+    posted = json.loads(page.locator("html").get_attribute("data-batch-submitted"))
+    assert [body.pop("url_or_id") for body in posted] == [video, profile, "invalid", video, "@retry"]
+    assert all(body == posted[0] for body in posted)
+    assert posted[0]["kind"] == "auto"
+    assert posted[0]["alias"] == "同批监控"
+    assert posted[0]["account_id"] == int(account_id)
+    assert posted[0]["platform"] == platform
+    assert posted[0]["interval_seconds"] == 600
     assert errors == []

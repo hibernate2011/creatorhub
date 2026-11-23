@@ -11,11 +11,32 @@ from openpyxl import load_workbook
 from sqlalchemy import event, text
 
 import app.db as db
-import app.main as main
+from fastapi import HTTPException
+
+from app.api import comments, danmaku
+from app.main import app
+from app.services.watch_records import _comment_dict, _danmaku_dict
 from app.engine.monitor import MonitorEngine
 from app.models import (CommentWatch, CommentRecord, CommentWatchIdReservation,
                         DanmakuWatch, DanmakuRecord, DanmakuWatchIdReservation)
-from test_project_optimizations import local_project, store
+@pytest.fixture
+def local_project(tmp_path):
+    previous_engine = db._engine
+    path = tmp_path / "watch-records.db"
+    db.init_db(str(path))
+    try:
+        yield SimpleNamespace(path=path)
+    finally:
+        db._engine.dispose()
+        db._engine = previous_engine
+
+
+def store(row):
+    with db.get_session() as session:
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.id
 
 
 @pytest.fixture(params=["comments", "danmaku"])
@@ -25,9 +46,9 @@ def records(local_project, request):
         watch=CommentWatch if comment else DanmakuWatch,
         record=CommentRecord if comment else DanmakuRecord,
         reservation=CommentWatchIdReservation if comment else DanmakuWatchIdReservation,
-        api=main.list_comments if comment else main.list_danmaku,
-        list=main.list_watches if comment else main.list_danmaku_watches,
-        delete=main.del_watch if comment else main.delete_danmaku_watch,
+        api=comments.list_comments if comment else danmaku.list_danmaku,
+        list=comments.list_watches if comment else danmaku.list_danmaku_watches,
+        delete=comments.del_watch if comment else danmaku.delete_danmaku_watch,
         ident="comment_id" if comment else "danmaku_id")
     extra = {"xsec_token": "private-token"} if comment else {}
     view.a = store(view.watch(platform="douyin", alias="观察 A", title="示例作品 A", kind="video",
@@ -80,7 +101,7 @@ def test_local_day_window_task_metadata_and_pagination_combine(records):
 
 @pytest.mark.parametrize("end", [datetime(2026,9,7), datetime(2026,9,8)])
 def test_invalid_capture_range_rejected(records, end):
-    with pytest.raises(main.HTTPException) as error:
+    with pytest.raises(HTTPException) as error:
         records.fetch(captured_from=datetime(2026,9,8), captured_before=end)
     assert error.value.status_code == 400
 
@@ -128,7 +149,7 @@ def test_legacy_list_shape_and_unknown_capture_time(records):
     r = records
     result = asyncio.run(r.api(watch_id=r.a, platform="douyin"))
     assert isinstance(result, list) and result[0]["watch_source"]["id"] == r.a
-    serialize = main._comment_dict if r.module == "comments" else main._danmaku_dict
+    serialize = _comment_dict if r.module == "comments" else _danmaku_dict
     row = r.record(watch_id=None, aweme_id="missing-time", **{r.ident:"unknown"}, created_at=None, create_time=123)
     assert serialize(row)["captured_at"] is None
 
@@ -147,7 +168,7 @@ def test_legacy_list_shape_and_unknown_capture_time(records):
 def test_legacy_comment_links(local_project, platform, work_id, watch_attrs, expected):
     watch_id = store(CommentWatch(platform=platform, aweme_id=work_id, **watch_attrs))
     store(CommentRecord(platform=platform, watch_id=watch_id, aweme_id=work_id, comment_id="old"))
-    [row] = asyncio.run(main.list_comments(watch_id=watch_id))
+    [row] = asyncio.run(comments.list_comments(watch_id=watch_id))
     assert row["work_url"] == expected
 
 
@@ -161,13 +182,13 @@ def test_saved_comment_links_survive_watch_deletion(local_project):
         watch_id, work_id, [{"comment_id": "new", "create_time": 1}], "监控",
         "作品名称", True, platform="tiktok", work_url=original_url))
     assert count == 1
-    rows = asyncio.run(main.list_comments(watch_id=watch_id))
+    rows = asyncio.run(comments.list_comments(watch_id=watch_id))
     assert all(row["work_url"] == original_url for row in rows)
     updated_url = f"https://www.tiktok.com/@renamed/video/{work_id}"
     asyncio.run(engine._ingest(
         watch_id, work_id, [], "监控", "", False, platform="tiktok", work_url=updated_url))
-    asyncio.run(main.del_watch(watch_id))
-    rows = asyncio.run(main.list_comments(watch_id=watch_id))
+    asyncio.run(comments.del_watch(watch_id))
+    rows = asyncio.run(comments.list_comments(watch_id=watch_id))
     assert {row["comment_id"] for row in rows} == {"old", "new"}
     assert all(row["work_url"] == updated_url and row["watch_source"]["deleted"] for row in rows)
 
@@ -213,7 +234,7 @@ def test_upgrade_and_restart_reserve_ids_even_after_deletion(records, local_proj
 def test_http_export_matches_filtered_records_and_full_ignores_filters(records):
     r = records
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://127.0.0.1") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
             params = {"platform":"douyin", "watch_id":r.a, "sort":"captured_desc",
                       "captured_from":"2026-09-08T08:00:00+08:00", "captured_before":"2026-09-09T08:00:00+08:00"}
             api = await client.get(f"/api/{r.module}", params={**params,"paginate":"true"})
@@ -233,7 +254,7 @@ def test_http_export_matches_filtered_records_and_full_ignores_filters(records):
 
 def test_comment_and_danmaku_id_namespaces_remain_independent(local_project):
     comment = store(CommentWatch(id=100))
-    danmaku = store(DanmakuWatch(id=100))
-    assert comment == danmaku == 100
-    asyncio.run(main.del_watch(comment)); asyncio.run(main.delete_danmaku_watch(danmaku))
-    assert store(CommentWatch()) > comment and store(DanmakuWatch()) > danmaku
+    danmaku_id = store(DanmakuWatch(id=100))
+    assert comment == danmaku_id == 100
+    asyncio.run(comments.del_watch(comment)); asyncio.run(danmaku.delete_danmaku_watch(danmaku_id))
+    assert store(CommentWatch()) > comment and store(DanmakuWatch()) > danmaku_id

@@ -9,31 +9,20 @@ npm run build:ui
 
 ## 源码与产物
 
+- `html/*.html`、`styles/base.css`：工作台 HTML 分区面板模板（8 个模块）与基础内联样式源码。
+- `app/*.js`：工作台核心业务逻辑按功能域拆分的 16 个模块化源码文件（请求模态、平台导航、扫码登录、账号、风控、账号中心、私信、代理设置、视频号通道、分享下载、批量采集、作品监控、评论/弹幕监听、多平台发布、自动评论与任务队列）。
 - `workbench.jsx`：React 组件与现有业务表单的连接。
+- `agent.jsx`、`agent.css`：AI 助手侧边栏组件与样式源码。
 - `ui/primitives.jsx`、`ui/motion.js`：基于 Radix 的组件与动效。
 - `brand.svg`：原始 Logo，独立于通用图标。
 - `icons.mjs`：生成本地 Lucide 图标集合，保留已有图标 ID。
 - `app/web/appearance.css`、`workbench.css`：共享样式。
-- `app/web/workbench.js`：随项目提供的构建产物，修改源码后需重新生成。
+- `app/web/index.html`、`app/web/app.js`、`app/web/agent.css`、`app/web/workbench.js`：随项目提供的构建产物（支持无 Node 环境直接运行），**请勿直接手工编辑产物文件**，修改 `frontend/` 下对应源码后运行 `npm run build:ui` 重新生成。
 
 业务表单移动而不复制，保留字段 ID、事件与提交逻辑。失败保留输入，恢复连接不自动重放写操作。修改弹窗时需保持键盘焦点、内部滚动及减少动态效果的兼容。
 
 标签页通过卡片的 `data-section` 与 `groupSpecs` 中的值绑定，不依赖卡片排列顺序。新增标签页时同步维护这两处，并声明适用的平台。
 临时隐藏功能时，在对应卡片上添加 `hidden`，标签入口和内容会一起隐藏；聚合私信目前按此方式保留但不展示。
-
-## 测试
-
-```bash
-python -m pytest -q
-```
-
-浏览器测试默认跳过。设置 `CREATORHUB_RUN_LOCAL_CDP=1` 后执行：
-
-```bash
-python -m pytest tests/test_web_appearance_browser.py tests/test_workbench_sections_browser.py -q
-```
-
-浏览器写操作使用隔离的示例接口，不操作真实账号。
 
 ## 界面预览维护
 
